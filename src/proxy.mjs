@@ -119,6 +119,25 @@ export function startProxy(targetUrl, port = 3000) {
          */
         proxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
           /**
+           * Rewrite redirect Location headers to stay on the proxy.
+           *
+           * When a site returns a 301/302 redirect, the Location header points
+           * to the real domain (e.g. https://client.com/page). The browser would
+           * follow that and leave localhost. We rewrite it to localhost so the
+           * browser stays on the proxy.
+           */
+          const location = proxyRes.headers['location'];
+          if (location) {
+            const targetOrigin = new URL(targetUrl).origin;
+            if (location.startsWith(targetOrigin) || location.startsWith('/')) {
+              const rewritten = location.startsWith('/')
+                ? `http://localhost:${port}${location}`
+                : location.replace(targetOrigin, `http://localhost:${port}`);
+              res.setHeader('location', rewritten);
+            }
+          }
+
+          /**
            * Strip security headers that would block our injected scripts.
            *
            * Content-Security-Policy (CSP) is a header sites use to whitelist
