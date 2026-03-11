@@ -1,0 +1,26 @@
+{
+  "name": "start-scripting",
+  "version": "1.0.0",
+  "description": "Local dev tool for building A/B tests on live websites",
+  "type": "module",
+  "bin": {
+    "ss": "./bin/ss.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "tests/_template/"
+  ],
+  "scripts": {
+    "build": "node bin/ss.mjs build",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.7",
+    "esbuild": "^0.24.2",
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^3.0.3",
+    "playwright": "^1.50.1"
+  }
+}
