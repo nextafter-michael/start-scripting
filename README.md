@@ -94,5 +94,5 @@ Paste the contents of `dist/my-test.js` into your A/B testing platform (Optimize
 ## Updating
 
 ```bash
-npm install -g github:garrett-a/start-scripting
+cd ~/.ss && git pull && npm install
 ```
