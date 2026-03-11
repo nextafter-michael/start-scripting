@@ -123,33 +123,36 @@ export function startProxy(targetUrl, port = 3000) {
            *
            * When a site returns a 301/302 redirect, the Location header points
            * to the real domain (e.g. https://client.com/page). The browser would
-           * follow that and leave localhost. We rewrite it to localhost so the
-           * browser stays on the proxy.
+           * follow that and leave localhost.
+           *
+           * We mutate proxyRes.headers directly because responseInterceptor calls
+           * res.writeHead(statusCode, proxyRes.headers) AFTER our callback, which
+           * would overwrite any res.setHeader() calls we make.
            */
           const location = proxyRes.headers['location'];
           if (location) {
             const targetOrigin = new URL(targetUrl).origin;
             if (location.startsWith(targetOrigin) || location.startsWith('/')) {
-              const rewritten = location.startsWith('/')
+              proxyRes.headers['location'] = location.startsWith('/')
                 ? `http://localhost:${port}${location}`
                 : location.replace(targetOrigin, `http://localhost:${port}`);
-              res.setHeader('location', rewritten);
             }
           }
 
           /**
-           * Strip security headers that would block our injected scripts.
+           * Strip security headers that would block our injected scripts or
+           * force the browser off the proxy.
            *
-           * Content-Security-Policy (CSP) is a header sites use to whitelist
-           * which scripts are allowed to run. Since our injected script and
-           * bundle are served from /__ss__/ on the same proxy, they'd normally
-           * pass CSP — but some sites use very strict policies, so we strip it
-           * to be safe during development.
+           * - Content-Security-Policy: whitelists which scripts can run
+           * - Strict-Transport-Security (HSTS): tells the browser to always use
+           *   HTTPS for this domain — if set, the browser will bypass our HTTP
+           *   proxy and connect directly to the live site
+           * - X-Frame-Options: blocks iframe embedding
            */
-          res.removeHeader('content-security-policy');
-          res.removeHeader('content-security-policy-report-only');
-          // X-Frame-Options blocks the page from being embedded in iframes
-          res.removeHeader('x-frame-options');
+          delete proxyRes.headers['content-security-policy'];
+          delete proxyRes.headers['content-security-policy-report-only'];
+          delete proxyRes.headers['strict-transport-security'];
+          delete proxyRes.headers['x-frame-options'];
 
           // Only modify HTML responses — leave JS, CSS, images, fonts, etc. alone
           const contentType = proxyRes.headers['content-type'] || '';
