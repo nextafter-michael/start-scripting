@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "build": "node bin/ss.mjs build",
-    "postinstall": "playwright install chromium"
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "commander": "^12.1.0",
