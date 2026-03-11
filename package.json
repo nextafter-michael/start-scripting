@@ -12,8 +12,7 @@
     "tests/_template/"
   ],
   "scripts": {
-    "build": "node bin/ss.mjs build",
-    "postinstall": "npx playwright install chromium"
+    "build": "node bin/ss.mjs build"
   },
   "dependencies": {
     "commander": "^12.1.0",

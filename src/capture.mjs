@@ -15,7 +15,11 @@
 
 import { chromium } from 'playwright';
 import { writeFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const TOOL_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
  * Capture the live page and save context files to ss-context/.
@@ -33,9 +37,21 @@ export async function capturePageContext(targetUrl, testName) {
   try {
     browser = await chromium.launch();
   } catch (err) {
-    console.warn(`  ⚠ Could not launch browser for page capture: ${err.message}`);
-    console.warn(`    Run "npx playwright install chromium" to fix this.\n`);
-    return;
+    // Chromium not downloaded yet — install it automatically on first use
+    if (err.message.includes('Executable') || err.message.includes('browserType.launch')) {
+      console.log('  Installing Chromium (one-time setup, ~100MB)...');
+      try {
+        const playwrightBin = join(TOOL_DIR, 'node_modules', '.bin', 'playwright');
+        execSync(`"${playwrightBin}" install chromium`, { stdio: 'inherit' });
+        browser = await chromium.launch();
+      } catch (installErr) {
+        console.warn(`  ⚠ Could not install Chromium: ${installErr.message}\n`);
+        return;
+      }
+    } else {
+      console.warn(`  ⚠ Could not launch browser: ${err.message}\n`);
+      return;
+    }
   }
 
   const page = await browser.newPage();
