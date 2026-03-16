@@ -71,17 +71,23 @@ program
 
     const port = parseInt(options.port, 10);
 
+    // Auto-prepend https:// if no protocol provided (e.g. "opb.org" → "https://opb.org")
+    if (!/^https?:\/\//i.test(url)) {
+      url = `https://${url}`;
+    }
+
     // Follow redirects to find the canonical URL (e.g. opb.org → www.opb.org)
     try {
-      const res = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+      const res = await fetch(url, { method: 'GET', redirect: 'follow' });
       const resolved = new URL(res.url);
       const canonical = `${resolved.protocol}//${resolved.host}`;
       if (canonical !== new URL(url).origin) {
         console.log(`\n  ↳ ${url} redirects to ${canonical} — using that instead`);
         url = canonical;
       }
-    } catch (_) {
-      // Network error — proceed with the original URL
+    } catch (err) {
+      console.warn(`  ⚠ Could not resolve canonical URL: ${err.message}`);
+      console.warn(`    Proceeding with ${url}`);
     }
 
     // Auto-create the test folder if it doesn't exist yet
