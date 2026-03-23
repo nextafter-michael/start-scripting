@@ -101,10 +101,11 @@ export async function startBuilder(testName) {
   });
 
   await ctx.rebuild();
-  await ctx.watch();
 
-  // Watch the variation directory for added/removed files so new scripts
-  // and stylesheets are picked up automatically without restarting.
+  // esbuild's built-in ctx.watch() uses FSEvents but doesn't reliably
+  // detect changes when the entry point is in .ss-cache/ with relative
+  // imports. Instead, we watch the variation directory ourselves and
+  // trigger ctx.rebuild() manually on any change.
   const { writeCacheEntry } = await import('./scaffold.mjs');
   const configPath = join(projectDir, '.ss-config.json');
   let activeVariation = 'v1';
@@ -118,15 +119,17 @@ export async function startBuilder(testName) {
 
   watch(variationDir, { persistent: false }, () => {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
+    debounceTimer = setTimeout(async () => {
       const currentFiles = new Set(readdirSync(variationDir));
-      // Only regenerate the cache entry when files are added or removed
+      // Regenerate the cache entry when files are added or removed
       if (currentFiles.size !== knownFiles.size ||
           [...currentFiles].some((f) => !knownFiles.has(f))) {
         writeCacheEntry(testName, activeVariation);
         knownFiles = currentFiles;
         console.log(`  ↻ File list changed — updated imports`);
       }
+      // Rebuild on every change (content edits, additions, removals)
+      await ctx.rebuild();
     }, 200);
   });
 
