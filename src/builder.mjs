@@ -89,6 +89,7 @@ export async function startBuilder(testName) {
 
   const ctx = await esbuild.context({
     entryPoints: [entryPoint],
+    absWorkingDir: projectDir,
     outfile,
     bundle: true,
     format: 'iife',  // wraps everything in a function — keeps variables off the global scope
