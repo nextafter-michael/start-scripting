@@ -13,7 +13,7 @@
  */
 
 import * as esbuild from 'esbuild';
-import { writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, existsSync, watch } from 'fs';
+import { writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -102,10 +102,9 @@ export async function startBuilder(testName) {
 
   await ctx.rebuild();
 
-  // esbuild's built-in ctx.watch() uses FSEvents but doesn't reliably
-  // detect changes when the entry point is in .ss-cache/ with relative
-  // imports. Instead, we watch the variation directory ourselves and
-  // trigger ctx.rebuild() manually on any change.
+  // esbuild's built-in ctx.watch() and fs.watch() don't reliably detect
+  // file changes on all systems. Poll file mtimes instead — checks every
+  // 500ms, only rebuilds when something actually changed.
   const { writeCacheEntry } = await import('./scaffold.mjs');
   const configPath = join(projectDir, '.ss-config.json');
   let activeVariation = 'v1';
@@ -114,24 +113,39 @@ export async function startBuilder(testName) {
   } catch {}
 
   const variationDir = join(projectDir, 'tests', testName, activeVariation);
-  let knownFiles = new Set(readdirSync(variationDir));
-  let debounceTimer;
 
-  watch(variationDir, { persistent: false }, () => {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(async () => {
-      const currentFiles = new Set(readdirSync(variationDir));
-      // Regenerate the cache entry when files are added or removed
-      if (currentFiles.size !== knownFiles.size ||
-          [...currentFiles].some((f) => !knownFiles.has(f))) {
-        writeCacheEntry(testName, activeVariation);
-        knownFiles = currentFiles;
-        console.log(`  ↻ File list changed — updated imports`);
-      }
-      // Rebuild on every change (content edits, additions, removals)
-      await ctx.rebuild();
-    }, 200);
-  });
+  function getSnapshot() {
+    const files = readdirSync(variationDir);
+    const snapshot = {};
+    for (const f of files) {
+      try { snapshot[f] = statSync(join(variationDir, f)).mtimeMs; } catch {}
+    }
+    return snapshot;
+  }
+
+  let lastSnapshot = getSnapshot();
+
+  setInterval(async () => {
+    const current = getSnapshot();
+    const lastKeys = Object.keys(lastSnapshot);
+    const currentKeys = Object.keys(current);
+
+    // Check if any files were added, removed, or modified
+    const changed = currentKeys.length !== lastKeys.length ||
+      currentKeys.some((f) => lastSnapshot[f] !== current[f]);
+
+    if (!changed) return;
+
+    // Regenerate cache entry if files were added or removed
+    if (currentKeys.length !== lastKeys.length ||
+        currentKeys.some((f) => !(f in lastSnapshot))) {
+      writeCacheEntry(testName, activeVariation);
+      console.log(`  ↻ File list changed — updated imports`);
+    }
+
+    lastSnapshot = current;
+    await ctx.rebuild();
+  }, 500);
 
   console.log(`✔ Watching tests/${testName}/`);
 }
