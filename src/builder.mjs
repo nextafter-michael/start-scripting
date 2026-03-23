@@ -40,6 +40,7 @@ __ss_style.textContent = ${JSON.stringify(css)};
 document.head.appendChild(__ss_style);
           `.trim(),
           loader: 'js',
+          watchFiles: [args.path],
         };
       });
     },
@@ -127,7 +128,9 @@ export async function startBuilder(testName) {
   let lastSnapshot = getSnapshot();
   console.log(`  [debug] Initial snapshot:`, JSON.stringify(lastSnapshot));
 
+  let rebuilding = false;
   setInterval(async () => {
+    if (rebuilding) return;
     const current = getSnapshot();
     const lastKeys = Object.keys(lastSnapshot);
     const currentKeys = Object.keys(current);
@@ -139,15 +142,18 @@ export async function startBuilder(testName) {
     if (!changed) return;
     console.log(`  [debug] Change detected:`, JSON.stringify(current));
 
-    // Regenerate cache entry if files were added or removed
-    if (currentKeys.length !== lastKeys.length ||
-        currentKeys.some((f) => !(f in lastSnapshot))) {
-      writeCacheEntry(testName, activeVariation);
-      console.log(`  ↻ File list changed — updated imports`);
-    }
+    // Regenerate cache entry so esbuild sees a changed entry point
+    writeCacheEntry(testName, activeVariation);
 
     lastSnapshot = current;
-    await ctx.rebuild();
+    rebuilding = true;
+    try {
+      await ctx.rebuild();
+    } catch (err) {
+      console.error(`  ✖ Rebuild error:`, err.message);
+    } finally {
+      rebuilding = false;
+    }
   }, 500);
 
   console.log(`✔ Watching tests/${testName}/`);
