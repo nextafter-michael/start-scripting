@@ -148,9 +148,12 @@ const INJECT_SNIPPET = `
  *
  * @param {string} targetUrl - The live site to mirror (e.g. "https://client.com")
  * @param {number} port      - Local port to run on (default 3000)
+ * @param {object} [bypassHeaders] - Optional headers to forward (from Cloudflare bypass)
+ * @param {string} [bypassHeaders.cookie] - Cookie string (e.g. "cf_clearance=...")
+ * @param {string} [bypassHeaders.userAgent] - User-Agent that passed the challenge
  * @returns {Promise<void>}  - Resolves once the server is up and listening
  */
-export function startProxy(targetUrl, port = 3000) {
+export function startProxy(targetUrl, port = 3000, bypassHeaders = null) {
   // Create the Express app — think of this as an empty rulebook
   const app = express();
 
@@ -245,6 +248,21 @@ export function startProxy(targetUrl, port = 3000) {
       changeOrigin: true,
       selfHandleResponse: true,
       on: {
+        /**
+         * proxyReq fires before the request is sent to the live site.
+         * If we have bypass headers (from solving a Cloudflare challenge),
+         * inject the cookies and user-agent so the live site accepts us.
+         */
+        proxyReq: (proxyReq, req, res) => {
+          if (bypassHeaders) {
+            if (bypassHeaders.cookie) {
+              proxyReq.setHeader("Cookie", bypassHeaders.cookie);
+            }
+            if (bypassHeaders.userAgent) {
+              proxyReq.setHeader("User-Agent", bypassHeaders.userAgent);
+            }
+          }
+        },
         /**
          * proxyRes fires when the live site sends a response back.
          * responseInterceptor() buffers the full response body, then calls our

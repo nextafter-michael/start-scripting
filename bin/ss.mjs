@@ -76,18 +76,76 @@ program
       url = `https://${url}`;
     }
 
-    // Follow redirects to find the canonical URL (e.g. opb.org → www.opb.org)
+    // Resolve redirects and bypass bot protection (Cloudflare, etc.)
+    // Uses Playwright with a real browser so challenges are solved automatically.
+    let bypassHeaders = null;
     try {
-      const res = await fetch(url, { method: 'GET', redirect: 'follow' });
-      const resolved = new URL(res.url);
-      const canonical = `${resolved.protocol}//${resolved.host}`;
-      if (canonical !== new URL(url).origin) {
-        console.log(`\n  ↳ ${url} redirects to ${canonical} — using that instead`);
-        url = canonical;
+      const { chromium } = await import('playwright');
+      console.log('\n  Launching browser to solve security challenges...');
+      const browser = await chromium.launch({ headless: true });
+      const context = await browser.newContext();
+      const page = await context.newPage();
+
+      // Navigate and wait for the page to settle past any challenge screens
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+
+      // If the challenge didn't resolve with headless, retry headed so the user can interact
+      const bodyText = await page.evaluate(() => document.body.innerText);
+      if (/security verification|checking your browser|just a moment/i.test(bodyText)) {
+        await browser.close();
+        console.log('  Security challenge detected — opening visible browser for verification...');
+        const headedBrowser = await chromium.launch({ headless: false });
+        const headedContext = await headedBrowser.newContext();
+        const headedPage = await headedContext.newPage();
+        await headedPage.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+
+        // Wait for the challenge to clear (poll for up to 60s)
+        await headedPage.waitForFunction(
+          () => !/security verification|checking your browser|just a moment/i.test(document.body.innerText),
+          { timeout: 60000 }
+        ).catch(() => {
+          console.warn('  ⚠ Challenge may not have cleared — proceeding anyway');
+        });
+
+        // Pick up the final URL (handles redirects like opb.org → www.opb.org)
+        const finalUrl = new URL(headedPage.url());
+        const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
+        if (canonical !== new URL(url).origin) {
+          console.log(`  ↳ ${url} redirects to ${canonical} — using that instead`);
+          url = canonical;
+        }
+
+        // Extract cookies and user-agent for the proxy
+        const cookies = await headedContext.cookies();
+        const ua = await headedPage.evaluate(() => navigator.userAgent);
+        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        if (cookieStr) {
+          bypassHeaders = { cookie: cookieStr, userAgent: ua };
+          console.log(`  ✔ Captured ${cookies.length} cookies for proxy bypass`);
+        }
+
+        await headedBrowser.close();
+      } else {
+        // Headless worked fine — extract redirect info and cookies
+        const finalUrl = new URL(page.url());
+        const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
+        if (canonical !== new URL(url).origin) {
+          console.log(`\n  ↳ ${url} redirects to ${canonical} — using that instead`);
+          url = canonical;
+        }
+
+        const cookies = await context.cookies();
+        const ua = await page.evaluate(() => navigator.userAgent);
+        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        if (cookieStr) {
+          bypassHeaders = { cookie: cookieStr, userAgent: ua };
+        }
+
+        await browser.close();
       }
     } catch (err) {
-      console.warn(`  ⚠ Could not resolve canonical URL: ${err.message}`);
-      console.warn(`    Proceeding with ${url}`);
+      console.warn(`  ⚠ Browser bypass failed: ${err.message}`);
+      console.warn(`    Proceeding without bypass — site may block requests`);
     }
 
     // Auto-create the test folder if it doesn't exist yet
@@ -117,7 +175,7 @@ program
     // Proxy gets origin only — request paths are appended by http-proxy
     await Promise.all([
       startBuilder(testName),
-      startProxy(targetOrigin, port),
+      startProxy(targetOrigin, port, bypassHeaders),
       capturePageContext(url, testName),
     ]);
 
