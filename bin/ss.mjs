@@ -76,65 +76,47 @@ program
       url = `https://${url}`;
     }
 
-    // Resolve redirects and detect bot protection (Cloudflare, etc.)
-    // If the site has bot protection, we keep a Playwright browser alive and
-    // route all proxy requests through it (real TLS fingerprint).
-    let fetcherPage = null;
+    // Detect bot protection (Cloudflare, etc.) with a quick headless probe.
+    let useCDP = false;
     try {
       const { chromium } = await import('playwright');
       console.log('\n  Checking for bot protection...');
-      let browser = await chromium.launch({ headless: true });
-      let context = await browser.newContext();
-      let page = await context.newPage();
-
-      // Use domcontentloaded — Cloudflare challenge pages never reach networkidle
-      // because they continuously poll. We just need enough to read the page text.
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      // Give challenge scripts a moment to render their UI
+      const probe = await chromium.launch({ headless: true });
+      const ctx = await probe.newContext();
+      const pg = await ctx.newPage();
+      await pg.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       await new Promise(r => setTimeout(r, 3000));
+      const bodyText = await pg.evaluate(() => document.body.innerText);
+      useCDP = /security verification|checking your browser|just a moment/i.test(bodyText);
 
-      // Detect Cloudflare / bot challenge pages
-      const bodyText = await page.evaluate(() => document.body.innerText);
-      const isChallenge = /security verification|checking your browser|just a moment/i.test(bodyText);
-
-      if (isChallenge) {
-        await browser.close();
-        console.log('  Security challenge detected — opening browser for verification...');
-        browser = await chromium.launch({ headless: false });
-        context = await browser.newContext();
-        page = await context.newPage();
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-        // Wait for the challenge to clear (up to 60s for user interaction)
-        await page.waitForFunction(
-          () => !/security verification|checking your browser|just a moment/i.test(document.body.innerText),
-          { timeout: 60000 }
-        ).catch(() => {
-          console.warn('  ⚠ Challenge may not have cleared — proceeding anyway');
-        });
-      }
-
-      // Pick up the final URL (handles redirects like opb.org → www.opb.org)
-      const finalUrl = new URL(page.url());
-      const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
-      if (canonical !== new URL(url).origin) {
-        console.log(`  ↳ ${url} redirects to ${canonical} — using that instead`);
-        url = canonical;
-      }
-
-      if (isChallenge) {
-        // Keep the page alive — it already passed Cloudflare's challenge.
-        // The proxy will use this exact page for fetch() calls so they
-        // inherit the cleared challenge state and TLS fingerprint.
-        fetcherPage = page;
-        console.log('  ✔ Bot protection bypassed — browser will stay open for proxying');
+      if (!useCDP) {
+        // No challenge — check for redirects (e.g. opb.org → www.opb.org)
+        const finalUrl = new URL(pg.url());
+        const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
+        if (canonical !== new URL(url).origin) {
+          console.log(`  ↳ ${url} redirects to ${canonical} — using that instead`);
+          url = canonical;
+        }
+        console.log('  ✔ No bot protection detected');
       } else {
-        // No challenge — close the browser, use normal http-proxy
-        await browser.close();
+        console.log('  ⚠ Bot protection detected — will use CDP mode');
       }
+      await probe.close();
     } catch (err) {
-      console.warn(`  ⚠ Browser check failed: ${err.message}`);
-      console.warn(`    Proceeding with standard proxy`);
+      console.warn(`  ⚠ Probe failed: ${err.message} — proceeding with standard proxy`);
+    }
+
+    // Follow redirects for non-CF sites (CF sites handle this in Chrome)
+    if (!useCDP) {
+      try {
+        const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+        const resolved = new URL(res.url);
+        const canonical = `${resolved.protocol}//${resolved.host}`;
+        if (canonical !== new URL(url).origin) {
+          console.log(`  ↳ ${url} redirects to ${canonical} — using that instead`);
+          url = canonical;
+        }
+      } catch {}
     }
 
     // Auto-create the test folder if it doesn't exist yet
@@ -160,21 +142,112 @@ program
     const { startProxy } = await import('../src/proxy.mjs');
     const { capturePageContext } = await import('../src/capture.mjs');
 
-    // Start proxy + builder, then capture page context in parallel
-    // Proxy gets origin only — request paths are appended by http-proxy
-    await Promise.all([
-      startBuilder(testName),
-      startProxy(targetOrigin, port, fetcherPage),
-      capturePageContext(url, testName),
-    ]);
+    if (useCDP) {
+      // ── CDP mode ─────────────────────────────────────────────────────────
+      // Cloudflare blocks Playwright and Node.js HTTP. Instead, launch the
+      // user's real Chrome with a debugging port and inject scripts via CDP.
+      // Chrome handles Cloudflare natively — no proxy needed for site content.
+      const { spawn: spawnProcess } = await import('child_process');
+      const { tmpdir } = await import('os');
 
-    // Open the proxied site at the original path
-    const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
-    exec(`${openCmd} http://localhost:${port}${targetPath}`);
+      const chromePaths = {
+        darwin: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        linux: '/usr/bin/google-chrome',
+        win32: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      };
+      const chromePath = chromePaths[process.platform];
+      if (!chromePath) {
+        console.error('✖ Could not find Chrome. CDP mode requires Google Chrome.');
+        process.exit(1);
+      }
 
-    console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
-    console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
-    console.log('  Press Ctrl+C to stop.\n');
+      const debugPort = 9222;
+      const userDataDir = join(tmpdir(), `ss-chrome-${Date.now()}`);
+
+      console.log('  Launching Chrome with DevTools protocol...');
+      const chromeProc = spawnProcess(chromePath, [
+        `--remote-debugging-port=${debugPort}`,
+        `--user-data-dir=${userDataDir}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        url,
+      ], { stdio: 'ignore', detached: false });
+
+      // Clean up Chrome when the CLI exits
+      const cleanup = () => { try { chromeProc.kill(); } catch {} };
+      process.on('exit', cleanup);
+      process.on('SIGINT', () => { cleanup(); process.exit(0); });
+
+      // Wait for Chrome's debug port to be ready
+      for (let i = 0; i < 30; i++) {
+        try {
+          const r = await fetch(`http://localhost:${debugPort}/json/version`);
+          if (r.ok) break;
+        } catch {}
+        await new Promise(r => setTimeout(r, 500));
+      }
+
+      // Connect Playwright to Chrome via CDP
+      const { chromium } = await import('playwright');
+      const cdpBrowser = await chromium.connectOverCDP(`http://localhost:${debugPort}`);
+      const cdpContext = cdpBrowser.contexts()[0];
+
+      // Inject bundle loader + livereload on every page navigation.
+      // This runs at document-start via CDP's Page.addScriptToEvaluateOnNewDocument.
+      // Since Chrome was launched normally (not by Playwright), navigator.webdriver
+      // is NOT set and Cloudflare treats it as a real browser.
+      await cdpContext.addInitScript(`
+        document.addEventListener('DOMContentLoaded', () => {
+          // Load the A/B test bundle
+          var s = document.createElement('script');
+          s.src = 'http://localhost:${port}/__ss__/bundle.js';
+          document.head.appendChild(s);
+
+          // Livereload: poll for rebuilds
+          var _ssLast = null;
+          setInterval(function() {
+            fetch('http://localhost:${port}/__ss__/.reload?t=' + Date.now())
+              .then(function(r) { return r.text(); })
+              .then(function(ts) {
+                if (_ssLast !== null && ts !== _ssLast) location.reload();
+                _ssLast = ts;
+              })
+              .catch(function() {});
+          }, 1000);
+        });
+      `);
+
+      console.log('  ✔ Scripts will be injected after Cloudflare clears');
+      console.log('  ℹ Solve the security check in Chrome — your test loads automatically after.\n');
+
+      // Start local server for /__ss__/* + builder + capture in parallel
+      await Promise.all([
+        startBuilder(testName),
+        startProxy(targetOrigin, port, { localOnly: true }),
+        capturePageContext(url, testName),
+      ]);
+
+      // Chrome is already open — don't open localhost
+      console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
+      console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
+      console.log('  Press Ctrl+C to stop.\n');
+
+    } else {
+      // ── Standard proxy mode ──────────────────────────────────────────────
+      await Promise.all([
+        startBuilder(testName),
+        startProxy(targetOrigin, port),
+        capturePageContext(url, testName),
+      ]);
+
+      // Open the proxied site at the original path
+      const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+      exec(`${openCmd} http://localhost:${port}${targetPath}`);
+
+      console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
+      console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
+      console.log('  Press Ctrl+C to stop.\n');
+    }
 
     process.stdin.resume();
   });

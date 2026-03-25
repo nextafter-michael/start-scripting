@@ -185,21 +185,17 @@ function injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET) {
  *
  * @param {string} targetUrl    - The live site to mirror (e.g. "https://client.com")
  * @param {number} port         - Local port to run on (default 3000)
- * @param {object|null} fetcherPage - A Playwright page that has already passed Cloudflare's
- *                                   challenge. When provided, all proxy requests are fetched
- *                                   through this page's fetch() (real TLS fingerprint).
- * @returns {Promise<void>}        - Resolves once the server is up and listening
+ * @param {object} [options]    - Optional settings
+ * @param {boolean} [options.localOnly] - If true, only serve /__ss__/* routes (no proxy).
+ *                                        Used in CDP mode where Chrome loads the site directly.
+ * @returns {Promise<void>}     - Resolves once the server is up and listening
  */
-export async function startProxy(targetUrl, port = 3000, fetcherPage = null) {
+export async function startProxy(targetUrl, port = 3000, { localOnly = false } = {}) {
   const app = express();
 
   const targetOrigin = new URL(targetUrl).origin;
   const localOrigin = `http://localhost:${port}`;
   const INJECT_SNIPPET = buildInjectSnippet(localOrigin);
-
-  if (fetcherPage) {
-    console.log("  ✔ Browser-based proxy active (Cloudflare bypass)");
-  }
 
   /**
    * ROUTE 1: Serve the compiled bundle
@@ -258,105 +254,7 @@ export async function startProxy(targetUrl, port = 3000, fetcherPage = null) {
     res.json({ ok: true, active: v });
   });
 
-  /**
-   * MIDDLEWARE: Browser-based proxy (for Cloudflare-protected sites)
-   *
-   * Cloudflare allows full browser navigations (page.goto) but blocks
-   * programmatic fetch() calls, even from within the same page. So:
-   *
-   *   - HTML pages: use page.goto() → page.content() to get the rendered DOM
-   *   - Sub-resources (CSS, JS, images): redirect the user's real browser to
-   *     load them directly from the live domain. A <base href> tag makes all
-   *     relative URLs resolve to the live domain automatically.
-   *
-   * A click interceptor keeps navigation on localhost so links still work.
-   */
-  if (fetcherPage) {
-    // Serialize HTML page requests — page.goto() can't run concurrently
-    let navigating = false;
-    const navQueue = [];
-
-    function enqueueNavigation(fn) {
-      return new Promise((resolve, reject) => {
-        navQueue.push({ fn, resolve, reject });
-        if (!navigating) processQueue();
-      });
-    }
-
-    async function processQueue() {
-      if (navQueue.length === 0) { navigating = false; return; }
-      navigating = true;
-      const { fn, resolve, reject } = navQueue.shift();
-      try { resolve(await fn()); } catch (e) { reject(e); }
-      processQueue();
-    }
-
-    app.use(async (req, res) => {
-      const accept = req.headers["accept"] || "";
-      const fullUrl = targetOrigin + req.url;
-
-      // HTML page requests — navigate via Playwright
-      if (accept.includes("text/html")) {
-        console.log(`  [browser] ${req.url}`);
-        try {
-          const html = await enqueueNavigation(async () => {
-            await fetcherPage.goto(fullUrl, { waitUntil: "load", timeout: 30000 });
-            return await fetcherPage.content();
-          });
-
-          // Inject <base href> so relative URLs (images, CSS, JS) resolve to
-          // the live domain. The user's real browser fetches them directly —
-          // no proxy needed, and Cloudflare accepts real browser requests.
-          let processed = html.replace(
-            /(<head[^>]*>)/i,
-            `$1\n<base href="${targetOrigin}/">`,
-          );
-
-          // Inject our scripts + a click interceptor that keeps <a> navigation
-          // on localhost instead of following the <base href> to the live domain.
-          const variationHtml = loadVariationHtml();
-          const clickInterceptor = `
-<script>
-  document.addEventListener('click', function(e) {
-    var a = e.target.closest('a');
-    if (!a) return;
-    var href = a.href;
-    if (href && href.startsWith('${targetOrigin}')) {
-      e.preventDefault();
-      window.location.href = href.replace('${targetOrigin}', '${localOrigin}');
-    }
-  }, true);
-</script>`;
-          const fullSnippet =
-            (variationHtml ? variationHtml + "\n" : "") +
-            INJECT_SNIPPET + "\n" + clickInterceptor;
-
-          if (/<\/body>/i.test(processed)) {
-            processed = processed.replace(/<\/body>/i, fullSnippet + "\n</body>");
-          } else {
-            processed += fullSnippet;
-          }
-
-          res.setHeader("Content-Type", "text/html; charset=utf-8");
-          res.setHeader("Cache-Control", "no-store");
-          // Strip security headers
-          res.removeHeader("content-security-policy");
-          res.removeHeader("strict-transport-security");
-          res.removeHeader("x-frame-options");
-          res.send(processed);
-        } catch (err) {
-          console.error(`  ✖ Navigation failed: ${err.message}`);
-          res.status(502).send(`Proxy error: ${err.message}`);
-        }
-        return;
-      }
-
-      // Non-HTML requests — redirect to the live domain so the user's real
-      // browser fetches them directly (Cloudflare trusts real browsers).
-      console.log(`  [redirect] ${req.url}`);
-      res.redirect(302, fullUrl);
-    });
-  } else {
+  if (!localOnly) {
     /**
      * MIDDLEWARE: Standard http-proxy-middleware (for sites without bot protection)
      */
