@@ -190,7 +190,7 @@ function injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET) {
  *                                        Used in CDP mode where Chrome loads the site directly.
  * @returns {Promise<void>}     - Resolves once the server is up and listening
  */
-export async function startProxy(targetUrl, port = 3000, { localOnly = false } = {}) {
+export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = {}) {
   const app = express();
 
   const targetOrigin = new URL(targetUrl).origin;
@@ -264,7 +264,44 @@ export async function startProxy(targetUrl, port = 3000, { localOnly = false } =
     res.json({ ok: true, active: v });
   });
 
-  if (!localOnly) {
+  if (pwFetcher) {
+    /**
+     * MIDDLEWARE: Playwright-backed proxy (for Cloudflare-protected sites)
+     *
+     * HTML requests are fetched via Playwright's real browser engine (which
+     * passes CF bot detection), then served with a <base href> so sub-resources
+     * resolve to the real domain. Non-HTML requests are 302'd to the real site
+     * so the user's browser fetches them directly (real browsers pass CF fine).
+     */
+    app.use(async (req, res) => {
+      const accept = req.headers["accept"] || "";
+      const fullUrl = targetOrigin + req.originalUrl;
+
+      if (accept.includes("text/html")) {
+        try {
+          console.log(`  [PW] ${req.method} ${req.url}`);
+          let html = await pwFetcher.fetchPage(fullUrl);
+          // Insert <base href> so relative URLs resolve to the real domain
+          const baseTag = `<base href="${targetOrigin}/">`;
+          if (/<head[^>]*>/i.test(html)) {
+            html = html.replace(/(<head[^>]*>)/i, `$1\n${baseTag}`);
+          } else {
+            html = baseTag + "\n" + html;
+          }
+          html = injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET);
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.setHeader("Cache-Control", "no-store");
+          res.send(html);
+        } catch (err) {
+          console.error(`  [PW] Error fetching ${req.url}:`, err.message);
+          res.status(502).send("Proxy error: " + err.message);
+        }
+      } else {
+        // Non-HTML: redirect to real domain so browser fetches directly
+        res.redirect(302, fullUrl);
+      }
+    });
+  } else {
     /**
      * MIDDLEWARE: Standard http-proxy-middleware (for sites without bot protection)
      */

@@ -28,8 +28,10 @@ const TOOL_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
  *
  * @param {string} targetUrl - The live site URL to capture
  * @param {string} testName  - Active test name (included in page.md for AI context)
+ * @param {object} [options]
+ * @param {Array}  [options.cookies] - Cookies to inject (e.g. CF clearance from PwFetcher)
  */
-export async function capturePageContext(targetUrl, testName) {
+export async function capturePageContext(targetUrl, testName, { cookies } = {}) {
   const contextDir = join(process.cwd(), 'ss-context');
   mkdirSync(contextDir, { recursive: true });
 
@@ -62,10 +64,16 @@ export async function capturePageContext(targetUrl, testName) {
     { name: 'mobile',  width: 375,  height: 812 },
   ];
 
-  const page = await browser.newPage();
+  const context = await browser.newContext({
+    viewport: { width: viewports[0].width, height: viewports[0].height },
+  });
 
-  // Load the page once at desktop size — used for HTML + token extraction
-  await page.setViewportSize({ width: viewports[0].width, height: viewports[0].height });
+  // Inject CF clearance cookies if provided (for Cloudflare-protected sites)
+  if (cookies && cookies.length) {
+    await context.addCookies(cookies);
+  }
+
+  const page = await context.newPage();
 
   try {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });

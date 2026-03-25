@@ -77,7 +77,7 @@ program
     }
 
     // Detect bot protection (Cloudflare, etc.) with a quick headless probe.
-    let useCDP = false;
+    let usePW = false;
     try {
       const { chromium } = await import('playwright');
       console.log('\n  Checking for bot protection...');
@@ -87,9 +87,9 @@ program
       await pg.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       await new Promise(r => setTimeout(r, 3000));
       const bodyText = await pg.evaluate(() => document.body.innerText);
-      useCDP = /security verification|checking your browser|just a moment/i.test(bodyText);
+      usePW = /security verification|checking your browser|just a moment/i.test(bodyText);
 
-      if (!useCDP) {
+      if (!usePW) {
         // No challenge — check for redirects (e.g. opb.org → www.opb.org)
         const finalUrl = new URL(pg.url());
         const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
@@ -99,7 +99,7 @@ program
         }
         console.log('  ✔ No bot protection detected');
       } else {
-        console.log('  ⚠ Bot protection detected — will use CDP mode');
+        console.log('  ⚠ Bot protection detected — will use Playwright bypass');
       }
       await probe.close();
     } catch (err) {
@@ -107,7 +107,7 @@ program
     }
 
     // Follow redirects for non-CF sites (CF sites handle this in Chrome)
-    if (!useCDP) {
+    if (!usePW) {
       try {
         const res = await fetch(url, { method: 'GET', redirect: 'follow' });
         const resolved = new URL(res.url);
@@ -142,134 +142,34 @@ program
     const { startProxy } = await import('../src/proxy.mjs');
     const { capturePageContext } = await import('../src/capture.mjs');
 
-    if (useCDP) {
-      // ── CDP mode ─────────────────────────────────────────────────────────
-      // Cloudflare blocks Playwright and Node.js HTTP. Instead, launch the
-      // user's real Chrome with a debugging port and inject scripts via CDP.
-      // Chrome handles Cloudflare natively — no proxy needed for site content.
-      const { spawn: spawnProcess } = await import('child_process');
-      const { tmpdir } = await import('os');
+    if (usePW) {
+      // ── Playwright proxy mode (Cloudflare bypass) ──────────────────────
+      // Uses a stealth Playwright browser as the fetch backend for the proxy.
+      // The user still works at localhost:3000 in their own browser.
+      const { PwFetcher } = await import('../src/pw-fetcher.mjs');
+      const pwFetcher = new PwFetcher();
 
-      const chromePaths = {
-        darwin: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        linux: '/usr/bin/google-chrome',
-        win32: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-      };
-      const chromePath = chromePaths[process.platform];
-      if (!chromePath) {
-        console.error('✖ Could not find Chrome. CDP mode requires Google Chrome.');
-        process.exit(1);
-      }
+      console.log('  Launching stealth browser to bypass Cloudflare...');
+      await pwFetcher.init(url);
 
-      const debugPort = 9222;
+      // Clean up Playwright on exit
+      const cleanup = async () => { await pwFetcher.close(); };
+      process.on('SIGINT', async () => { await cleanup(); process.exit(0); });
 
-      // Use the user's real Chrome profile so they get their cookies,
-      // extensions, and bookmarks. Requires Chrome to not already be running.
-      const homeDir = await import('os').then(os => os.homedir());
-      const defaultProfile = join(homeDir, 'Library', 'Application Support', 'Google', 'Chrome');
+      // Pass CF cookies to capture so screenshots work on protected sites
+      const cookies = await pwFetcher.getCookies();
 
-      // Check if Chrome is already running
-      let chromeRunning = false;
-      try {
-        const { execSync: execSyncFn } = await import('child_process');
-        const ps = execSyncFn('pgrep -x "Google Chrome"', { encoding: 'utf8' }).trim();
-        chromeRunning = ps.length > 0;
-      } catch {}
-
-      if (chromeRunning) {
-        console.error('\n  ✖ Chrome is already running.');
-        console.error('    CDP mode needs to launch Chrome with debugging enabled.');
-        console.error('    Please close Chrome and run this command again.\n');
-        process.exit(1);
-      }
-
-      console.log('  Launching Chrome with DevTools protocol...');
-
-      // Launch Chrome to about:blank — NOT the target URL.
-      // We need to set up CDP (CSP bypass + init script) BEFORE navigating,
-      // otherwise the first page load misses our injections.
-      const chromeProc = spawnProcess(chromePath, [
-        `--remote-debugging-port=${debugPort}`,
-        `--user-data-dir=${defaultProfile}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        'about:blank',
-      ], { stdio: 'ignore', detached: false });
-
-      // Clean up Chrome when the CLI exits
-      const cleanup = () => { try { chromeProc.kill(); } catch {} };
-      process.on('exit', cleanup);
-      process.on('SIGINT', () => { cleanup(); process.exit(0); });
-
-      // Wait for Chrome's debug port to be ready
-      for (let i = 0; i < 30; i++) {
-        try {
-          const r = await fetch(`http://localhost:${debugPort}/json/version`);
-          if (r.ok) break;
-        } catch {}
-        await new Promise(r => setTimeout(r, 500));
-      }
-
-      // Connect Playwright to Chrome via CDP
-      const { chromium } = await import('playwright');
-      const cdpBrowser = await chromium.connectOverCDP(`http://localhost:${debugPort}`);
-      const cdpContext = cdpBrowser.contexts()[0];
-      const cdpPage = cdpContext.pages()[0];
-
-      // Bypass Content-Security-Policy so the real site allows our localhost scripts.
-      // This is a Chrome-level flag — no request interception needed.
-      const cdpSession = await cdpContext.newCDPSession(cdpPage);
-      await cdpSession.send('Page.setBypassCSP', { enabled: true });
-
-      // Inject bundle loader + livereload on every page navigation.
-      // This runs at document-start via CDP's Page.addScriptToEvaluateOnNewDocument.
-      // Since Chrome was launched normally (not by Playwright), navigator.webdriver
-      // is NOT set and Cloudflare treats it as a real browser.
-      await cdpContext.addInitScript(`
-        // Only inject in the top-level frame — skip iframes (wufoo, recaptcha, etc.)
-        // to avoid CORS/PNA errors from cross-origin embedded frames.
-        if (window !== window.top) return;
-
-        document.addEventListener('DOMContentLoaded', () => {
-          console.log('[ss] Injecting test bundle from localhost:${port}...');
-
-          // Load the A/B test bundle
-          var s = document.createElement('script');
-          s.src = 'http://localhost:${port}/__ss__/bundle.js';
-          s.onload = function() { console.log('[ss] Bundle loaded ✔'); };
-          s.onerror = function() { console.error('[ss] Bundle failed to load — check CORS / server'); };
-          document.head.appendChild(s);
-
-          // Livereload: poll for rebuilds
-          var _ssLast = null;
-          setInterval(function() {
-            fetch('http://localhost:${port}/__ss__/.reload?t=' + Date.now())
-              .then(function(r) { return r.text(); })
-              .then(function(ts) {
-                if (_ssLast !== null && ts !== _ssLast) location.reload();
-                _ssLast = ts;
-              })
-              .catch(function() {});
-          }, 1000);
-        });
-      `);
-
-      // Start local server FIRST so /__ss__/* is ready before the page loads
-      await startProxy(targetOrigin, port, { localOnly: true });
-
-      // NOW navigate to the target — init script is already registered
-      console.log('  ✔ CDP ready — navigating to target...');
-      await cdpPage.goto(url, { waitUntil: 'commit' }).catch(() => {});
-
-      // Start builder + capture in parallel
       await Promise.all([
         startBuilder(testName),
-        capturePageContext(url, testName),
+        startProxy(targetOrigin, port, { pwFetcher }),
+        capturePageContext(url, testName, { cookies }),
       ]);
 
-      // In CDP mode the user works in the Chrome window, not localhost
-      console.log(`\n  ★ Work in the Chrome window that opened (not localhost).`);
-      console.log(`    Your scripts inject automatically on every page load.`);
+      // Open the proxied site at the original path
+      const openCmd = process.platform === 'darwin' ? 'open'
+        : process.platform === 'win32' ? 'start' : 'xdg-open';
+      exec(`${openCmd} http://localhost:${port}${targetPath}`);
+
       console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
       console.log('  Ask your AI: "Based on ss-context/page.md, [what you want]"');
       console.log('  Press Ctrl+C to stop.\n');
@@ -283,7 +183,8 @@ program
       ]);
 
       // Open the proxied site at the original path
-      const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+      const openCmd = process.platform === 'darwin' ? 'open'
+        : process.platform === 'win32' ? 'start' : 'xdg-open';
       exec(`${openCmd} http://localhost:${port}${targetPath}`);
 
       console.log(`  Edit tests/${testName}/${activeVariation}/variation.js to write your test.`);
