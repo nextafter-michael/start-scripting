@@ -144,36 +144,77 @@ const INJECT_SNIPPET = `
 </script>`;
 
 /**
+ * Inject our script snippet into an HTML string.
+ * Processes HTML in segments, skipping <script> blocks to avoid breaking
+ * inline JS that contains URL strings or </body> literals.
+ */
+function injectIntoHtml(html, targetOrigin, localOrigin) {
+  const escapedOrigin = targetOrigin.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  const originRe = new RegExp(`(=["'])${escapedOrigin}`, "gi");
+  const scriptRe = /(<script[\s\S]*?<\/script>)/gi;
+
+  const variationHtml = loadVariationHtml();
+  const fullSnippet =
+    (variationHtml ? variationHtml + "\n" : "") + INJECT_SNIPPET;
+
+  let injected = false;
+  html = html
+    .split(scriptRe)
+    .map((part, i) => {
+      if (i % 2 !== 0) return part;
+      let out = part.replace(originRe, `$1${localOrigin}`);
+      if (!injected && /<\/body>/i.test(out)) {
+        out = out.replace(/<\/body>/i, fullSnippet + "\n</body>");
+        injected = true;
+      }
+      return out;
+    })
+    .join("");
+
+  if (!injected) html += fullSnippet;
+  return html;
+}
+
+/**
  * Start the proxy server.
  *
- * @param {string} targetUrl - The live site to mirror (e.g. "https://client.com")
- * @param {number} port      - Local port to run on (default 3000)
- * @param {object} [bypassHeaders] - Optional headers to forward (from Cloudflare bypass)
- * @param {string} [bypassHeaders.cookie] - Cookie string (e.g. "cf_clearance=...")
- * @param {string} [bypassHeaders.userAgent] - User-Agent that passed the challenge
- * @returns {Promise<void>}  - Resolves once the server is up and listening
+ * @param {string} targetUrl    - The live site to mirror (e.g. "https://client.com")
+ * @param {number} port         - Local port to run on (default 3000)
+ * @param {object|null} browser - A Playwright browser context for Cloudflare-protected sites.
+ *                                When provided, HTML pages are fetched through the browser's
+ *                                network stack (real TLS fingerprint) instead of Node's http.
+ * @returns {Promise<void>}     - Resolves once the server is up and listening
  */
-export function startProxy(targetUrl, port = 3000, bypassHeaders = null) {
-  // Create the Express app — think of this as an empty rulebook
+export async function startProxy(targetUrl, port = 3000, browser = null) {
   const app = express();
+
+  const targetOrigin = new URL(targetUrl).origin;
+  const localOrigin = `http://localhost:${port}`;
+
+  // If we have a Playwright browser context, create a persistent "fetcher" page.
+  // All proxy requests will be routed through this page's fetch() so they use
+  // the browser's TLS fingerprint and cookies — passing Cloudflare.
+  let fetcherPage = null;
+  if (browser) {
+    fetcherPage = await browser.newPage();
+    // Navigate once to set the page's origin (needed for same-origin fetch)
+    await fetcherPage.goto(targetUrl, { waitUntil: "load", timeout: 30000 });
+    console.log("  ✔ Browser-based proxy active (Cloudflare bypass)");
+  }
 
   /**
    * ROUTE 1: Serve the compiled bundle
-   *
-   * app.get('/path', handler) means: when someone requests GET /path, run handler.
-   * This route is for /__ss__/bundle.js — the compiled A/B test code.
-   *
-   * Why /__ss__/ prefix? It's an unlikely path to conflict with the live site's
-   * own routes, so the proxy can intercept it before forwarding to the live site.
    */
   app.get("/__ss__/bundle.js", (req, res) => {
     const bundlePath = join(DIST_DIR, "bundle.js");
     if (existsSync(bundlePath)) {
       res.setHeader("Content-Type", "application/javascript");
-      res.setHeader("Cache-Control", "no-store"); // always fetch fresh — no caching
+      res.setHeader("Cache-Control", "no-store");
       res.send(readFileSync(bundlePath));
     } else {
-      // Return a comment so DevTools shows something useful instead of a 404
       res.setHeader("Content-Type", "application/javascript");
       res
         .status(200)
@@ -183,9 +224,6 @@ export function startProxy(targetUrl, port = 3000, bypassHeaders = null) {
 
   /**
    * ROUTE 2: Serve the livereload signal file
-   *
-   * The builder writes a timestamp here after every successful rebuild.
-   * The injected browser script polls this endpoint and refreshes when it changes.
    */
   app.get("/__ss__/.reload", (req, res) => {
     const reloadPath = join(DIST_DIR, ".reload");
@@ -202,9 +240,6 @@ export function startProxy(targetUrl, port = 3000, bypassHeaders = null) {
 
   /**
    * ROUTE 4: Switch active variation
-   *
-   * Updates the config and rewrites the esbuild cache entry so the next
-   * rebuild (triggered by the file change) loads the new variation.
    */
   app.get("/__ss__/switch", async (req, res) => {
     const v = req.query.v;
@@ -228,173 +263,135 @@ export function startProxy(targetUrl, port = 3000, bypassHeaders = null) {
   });
 
   /**
-   * MIDDLEWARE: The proxy
+   * MIDDLEWARE: Browser-based proxy (for Cloudflare-protected sites)
    *
-   * app.use(middleware) runs the middleware for every request that reaches this
-   * point (requests to /__ss__/* were already handled above, so they never get here).
+   * When a Playwright browser context is available, we fetch pages through
+   * the browser's own fetch() API inside page.evaluate(). This uses the
+   * browser's real TLS fingerprint and cookies, which Cloudflare accepts.
    *
-   * createProxyMiddleware forwards requests to the live site and returns their responses.
-   *
-   * Key options:
-   *   target          — where to forward requests
-   *   changeOrigin    — rewrites the Host header to match the target domain
-   *                     (required — otherwise the live site may reject the request)
-   *   selfHandleResponse — we control sending the response ourselves
-   *                        (needed so we can modify HTML before sending it)
+   * Falls through to http-proxy-middleware if no browser context is set.
    */
-  app.use(
-    createProxyMiddleware({
-      target: targetUrl,
-      changeOrigin: true,
-      selfHandleResponse: true,
-      on: {
-        /**
-         * proxyReq fires before the request is sent to the live site.
-         * If we have bypass headers (from solving a Cloudflare challenge),
-         * inject the cookies and user-agent so the live site accepts us.
-         */
-        proxyReq: (proxyReq, req, res) => {
-          if (bypassHeaders) {
-            if (bypassHeaders.cookie) {
-              proxyReq.setHeader("Cookie", bypassHeaders.cookie);
-            }
-            if (bypassHeaders.userAgent) {
-              proxyReq.setHeader("User-Agent", bypassHeaders.userAgent);
-            }
-          }
-        },
-        /**
-         * proxyRes fires when the live site sends a response back.
-         * responseInterceptor() buffers the full response body, then calls our
-         * function so we can inspect and modify it before sending to the browser.
-         */
-        proxyRes: responseInterceptor(
-          async (responseBuffer, proxyRes, req, res) => {
-            const status = proxyRes.statusCode;
-            const loc = proxyRes.headers["location"];
-            if (loc) {
-              console.log(`  [${status}] ${req.url} → ${loc}`);
-            } else {
-              console.log(`  [${status}] ${req.url}`);
-            }
-            /**
-             * Rewrite redirect Location headers to stay on the proxy.
-             *
-             * When a site returns a 301/302 redirect, the Location header points
-             * to the real domain (e.g. https://client.com/page). The browser would
-             * follow that and leave localhost.
-             *
-             * We mutate proxyRes.headers directly because responseInterceptor calls
-             * res.writeHead(statusCode, proxyRes.headers) AFTER our callback, which
-             * would overwrite any res.setHeader() calls we make.
-             */
-            const location = proxyRes.headers["location"];
-            if (location) {
-              if (location.startsWith("/")) {
-                // Relative redirect — prepend localhost origin
-                proxyRes.headers["location"] =
-                  `http://localhost:${port}${location}`;
+  if (fetcherPage) {
+    app.use(async (req, res) => {
+      const fullUrl = targetOrigin + req.url;
+      console.log(`  [browser] ${req.method} ${req.url}`);
+      try {
+        const result = await fetcherPage.evaluate(
+          async ({ url, method }) => {
+            const resp = await fetch(url, {
+              method,
+              credentials: "same-origin",
+              redirect: "follow",
+            });
+            const headers = {};
+            resp.headers.forEach((v, k) => { headers[k] = v; });
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = "";
+            for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+            return { status: resp.status, headers, bodyBase64: btoa(binary) };
+          },
+          { url: fullUrl, method: req.method },
+        );
+
+        const body = Buffer.from(result.bodyBase64, "base64");
+        const contentType = result.headers["content-type"] || "";
+
+        // Forward response headers, skipping ones we need to control
+        const skipHeaders = new Set([
+          "content-encoding", "transfer-encoding", "content-length",
+          "content-security-policy", "content-security-policy-report-only",
+          "strict-transport-security", "x-frame-options",
+        ]);
+        for (const [k, v] of Object.entries(result.headers)) {
+          if (!skipHeaders.has(k)) res.setHeader(k, v);
+        }
+        // Fix CORS
+        if (result.headers["access-control-allow-origin"]) {
+          res.setHeader("access-control-allow-origin", "*");
+        }
+
+        if (contentType.includes("text/html")) {
+          let html = body.toString("utf8");
+          html = injectIntoHtml(html, targetOrigin, localOrigin);
+          res.setHeader("Content-Type", contentType);
+          res.status(result.status).send(html);
+        } else if (contentType.includes("text/css")) {
+          const css = body.toString("utf8").split(targetOrigin).join(localOrigin);
+          res.setHeader("Content-Type", contentType);
+          res.status(result.status).send(css);
+        } else {
+          res.status(result.status).send(body);
+        }
+      } catch (err) {
+        console.error(`  ✖ Browser fetch failed: ${err.message}`);
+        res.status(502).send(`Proxy error: ${err.message}`);
+      }
+    });
+  } else {
+    /**
+     * MIDDLEWARE: Standard http-proxy-middleware (for sites without bot protection)
+     */
+    app.use(
+      createProxyMiddleware({
+        target: targetUrl,
+        changeOrigin: true,
+        selfHandleResponse: true,
+        on: {
+          proxyRes: responseInterceptor(
+            async (responseBuffer, proxyRes, req, res) => {
+              const status = proxyRes.statusCode;
+              const loc = proxyRes.headers["location"];
+              if (loc) {
+                console.log(`  [${status}] ${req.url} → ${loc}`);
               } else {
-                try {
-                  // Absolute redirect — swap whatever host/protocol is there with
-                  // localhost so the browser stays on the proxy. This handles
-                  // redirects to subdomains, www variants, or http↔https flips.
-                  const u = new URL(location);
-                  u.protocol = "http:";
-                  u.host = `localhost:${port}`;
-                  proxyRes.headers["location"] = u.toString();
-                } catch (_) {
-                  // Malformed URL — leave it alone
+                console.log(`  [${status}] ${req.url}`);
+              }
+
+              const location = proxyRes.headers["location"];
+              if (location) {
+                if (location.startsWith("/")) {
+                  proxyRes.headers["location"] =
+                    `http://localhost:${port}${location}`;
+                } else {
+                  try {
+                    const u = new URL(location);
+                    u.protocol = "http:";
+                    u.host = `localhost:${port}`;
+                    proxyRes.headers["location"] = u.toString();
+                  } catch (_) {}
                 }
               }
-            }
 
-            /**
-             * Strip security headers that would block our injected scripts or
-             * force the browser off the proxy.
-             *
-             * - Content-Security-Policy: whitelists which scripts can run
-             * - Strict-Transport-Security (HSTS): tells the browser to always use
-             *   HTTPS for this domain — if set, the browser will bypass our HTTP
-             *   proxy and connect directly to the live site
-             * - X-Frame-Options: blocks iframe embedding
-             */
-            delete proxyRes.headers["content-security-policy"];
-            delete proxyRes.headers["content-security-policy-report-only"];
-            delete proxyRes.headers["strict-transport-security"];
-            delete proxyRes.headers["x-frame-options"];
+              delete proxyRes.headers["content-security-policy"];
+              delete proxyRes.headers["content-security-policy-report-only"];
+              delete proxyRes.headers["strict-transport-security"];
+              delete proxyRes.headers["x-frame-options"];
 
-            // Fix duplicate CORS headers (e.g. "*, *") which Chrome rejects
-            if (proxyRes.headers["access-control-allow-origin"]) {
-              proxyRes.headers["access-control-allow-origin"] = "*";
-            }
+              if (proxyRes.headers["access-control-allow-origin"]) {
+                proxyRes.headers["access-control-allow-origin"] = "*";
+              }
 
-            const contentType = proxyRes.headers["content-type"] || "";
-            const targetOrigin = new URL(targetUrl).origin;
-            const localOrigin = `http://localhost:${port}`;
+              const contentType = proxyRes.headers["content-type"] || "";
 
-            // Rewrite CSS responses — safe to do a full replacement since CSS
-            // has no regex literals that could break from the substitution
-            if (contentType.includes("text/css")) {
-              const css = responseBuffer.toString("utf8");
-              return css.split(targetOrigin).join(localOrigin);
-            }
+              if (contentType.includes("text/css")) {
+                const css = responseBuffer.toString("utf8");
+                return css.split(targetOrigin).join(localOrigin);
+              }
 
-            if (contentType.includes("text/html")) {
-              let html = responseBuffer.toString("utf8");
+              if (contentType.includes("text/html")) {
+                let html = responseBuffer.toString("utf8");
+                return injectIntoHtml(html, targetOrigin, localOrigin);
+              }
 
-              // Process HTML in segments, skipping <script>...</script> blocks.
-              //
-              // Two operations must only touch real HTML markup, never inline JS:
-              //   1. URL rewriting — the origin may appear as a string literal
-              //      inside a polyfill script, and rewriting it there can break
-              //      the JS and cause the rest of the script to render as text.
-              //   2. </body> injection — polyfills often write a full HTML doc
-              //      into an iframe (r.write('...<body></body>...')), so the
-              //      first </body> in the raw text may be inside a script string,
-              //      not the real closing tag.
-              const escapedOrigin = targetOrigin.replace(
-                /[.*+?^${}()|[\]\\]/g,
-                "\\$&",
-              );
-              const originRe = new RegExp(`(=["'])${escapedOrigin}`, "gi");
-              const scriptRe = /(<script[\s\S]*?<\/script>)/gi;
+              return responseBuffer;
+            },
+          ),
+        },
+      }),
+    );
+  }
 
-              // Load optional HTML snippet from the active variation's index.html
-              const variationHtml = loadVariationHtml();
-              const fullSnippet =
-                (variationHtml ? variationHtml + "\n" : "") + INJECT_SNIPPET;
-
-              let injected = false;
-              html = html
-                .split(scriptRe)
-                .map((part, i) => {
-                  if (i % 2 !== 0) return part; // inside a script block — leave untouched
-                  let out = part.replace(originRe, `$1${localOrigin}`);
-                  if (!injected && /<\/body>/i.test(out)) {
-                    out = out.replace(/<\/body>/i, fullSnippet + "\n</body>");
-                    injected = true;
-                  }
-                  return out;
-                })
-                .join("");
-
-              if (!injected) html += fullSnippet;
-              return html;
-            }
-
-            // For non-HTML responses, return the buffer unchanged
-            return responseBuffer;
-          },
-        ),
-      },
-    }),
-  );
-
-  /**
-   * app.listen(port, callback) starts the server.
-   * We wrap it in a Promise so the caller can await it finishing startup.
-   */
   return new Promise((resolve) => {
     app.listen(port, () => {
       console.log(`\n✔ Proxy running → http://localhost:${port}`);

@@ -76,76 +76,65 @@ program
       url = `https://${url}`;
     }
 
-    // Resolve redirects and bypass bot protection (Cloudflare, etc.)
-    // Uses Playwright with a real browser so challenges are solved automatically.
-    let bypassHeaders = null;
+    // Resolve redirects and detect bot protection (Cloudflare, etc.)
+    // If the site has bot protection, we keep a Playwright browser alive and
+    // route all proxy requests through it (real TLS fingerprint).
+    let browserContext = null;
     try {
       const { chromium } = await import('playwright');
-      console.log('\n  Launching browser to solve security challenges...');
-      const browser = await chromium.launch({ headless: true });
-      const context = await browser.newContext();
-      const page = await context.newPage();
+      console.log('\n  Checking for bot protection...');
+      let browser = await chromium.launch({ headless: true });
+      let context = await browser.newContext();
+      let page = await context.newPage();
 
-      // Navigate and wait for the page to settle past any challenge screens
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+      // Use domcontentloaded — Cloudflare challenge pages never reach networkidle
+      // because they continuously poll. We just need enough to read the page text.
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      // Give challenge scripts a moment to render their UI
+      await new Promise(r => setTimeout(r, 3000));
 
-      // If the challenge didn't resolve with headless, retry headed so the user can interact
+      // Detect Cloudflare / bot challenge pages
       const bodyText = await page.evaluate(() => document.body.innerText);
-      if (/security verification|checking your browser|just a moment/i.test(bodyText)) {
-        await browser.close();
-        console.log('  Security challenge detected — opening visible browser for verification...');
-        const headedBrowser = await chromium.launch({ headless: false });
-        const headedContext = await headedBrowser.newContext();
-        const headedPage = await headedContext.newPage();
-        await headedPage.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+      const isChallenge = /security verification|checking your browser|just a moment/i.test(bodyText);
 
-        // Wait for the challenge to clear (poll for up to 60s)
-        await headedPage.waitForFunction(
+      if (isChallenge) {
+        await browser.close();
+        console.log('  Security challenge detected — opening browser for verification...');
+        browser = await chromium.launch({ headless: false });
+        context = await browser.newContext();
+        page = await context.newPage();
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+        // Wait for the challenge to clear (up to 60s for user interaction)
+        await page.waitForFunction(
           () => !/security verification|checking your browser|just a moment/i.test(document.body.innerText),
           { timeout: 60000 }
         ).catch(() => {
           console.warn('  ⚠ Challenge may not have cleared — proceeding anyway');
         });
+      }
 
-        // Pick up the final URL (handles redirects like opb.org → www.opb.org)
-        const finalUrl = new URL(headedPage.url());
-        const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
-        if (canonical !== new URL(url).origin) {
-          console.log(`  ↳ ${url} redirects to ${canonical} — using that instead`);
-          url = canonical;
-        }
+      // Pick up the final URL (handles redirects like opb.org → www.opb.org)
+      const finalUrl = new URL(page.url());
+      const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
+      if (canonical !== new URL(url).origin) {
+        console.log(`  ↳ ${url} redirects to ${canonical} — using that instead`);
+        url = canonical;
+      }
 
-        // Extract cookies and user-agent for the proxy
-        const cookies = await headedContext.cookies();
-        const ua = await headedPage.evaluate(() => navigator.userAgent);
-        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-        if (cookieStr) {
-          bypassHeaders = { cookie: cookieStr, userAgent: ua };
-          console.log(`  ✔ Captured ${cookies.length} cookies for proxy bypass`);
-        }
-
-        await headedBrowser.close();
+      if (isChallenge) {
+        // Keep the browser alive — proxy will fetch through it
+        browserContext = context;
+        console.log('  ✔ Bot protection bypassed — browser will stay open for proxying');
+        // Close the extra page (proxy.mjs will create its own fetcher page)
+        await page.close();
       } else {
-        // Headless worked fine — extract redirect info and cookies
-        const finalUrl = new URL(page.url());
-        const canonical = `${finalUrl.protocol}//${finalUrl.host}`;
-        if (canonical !== new URL(url).origin) {
-          console.log(`\n  ↳ ${url} redirects to ${canonical} — using that instead`);
-          url = canonical;
-        }
-
-        const cookies = await context.cookies();
-        const ua = await page.evaluate(() => navigator.userAgent);
-        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-        if (cookieStr) {
-          bypassHeaders = { cookie: cookieStr, userAgent: ua };
-        }
-
+        // No challenge — close the browser, use normal http-proxy
         await browser.close();
       }
     } catch (err) {
-      console.warn(`  ⚠ Browser bypass failed: ${err.message}`);
-      console.warn(`    Proceeding without bypass — site may block requests`);
+      console.warn(`  ⚠ Browser check failed: ${err.message}`);
+      console.warn(`    Proceeding with standard proxy`);
     }
 
     // Auto-create the test folder if it doesn't exist yet
@@ -175,7 +164,7 @@ program
     // Proxy gets origin only — request paths are appended by http-proxy
     await Promise.all([
       startBuilder(testName),
-      startProxy(targetOrigin, port, bypassHeaders),
+      startProxy(targetOrigin, port, browserContext),
       capturePageContext(url, testName),
     ]);
 
