@@ -85,21 +85,22 @@ function listVariations() {
 const DIST_DIR = join(process.cwd(), "dist");
 
 /**
- * This HTML snippet is injected into every page on the proxied site.
+ * Build the HTML snippet injected into every proxied page.
  *
- * It does two things:
- * 1. Loads bundle.js — your compiled A/B test code
- * 2. Polls /__ss__/.reload every second — when the file changes (after a
- *    rebuild), it refreshes the page automatically (livereload)
+ * Uses absolute URLs for /__ss__/* endpoints so that <base href> (used in
+ * Cloudflare bypass mode) doesn't redirect them to the live domain.
+ *
+ * @param {string} ssOrigin - The proxy origin, e.g. "http://localhost:3000"
  */
-const INJECT_SNIPPET = `
-<script src="/__ss__/bundle.js"></script>
+function buildInjectSnippet(ssOrigin) {
+  return `
+<script src="${ssOrigin}/__ss__/bundle.js"></script>
 <script>
   // Livereload: poll for changes and refresh when a new build is ready
   let _ssLastBuild = null;
   setInterval(async () => {
     try {
-      const r = await fetch('/__ss__/.reload?t=' + Date.now());
+      const r = await fetch('${ssOrigin}/__ss__/.reload?t=' + Date.now());
       const ts = await r.text();
       if (_ssLastBuild !== null && ts !== _ssLastBuild) location.reload();
       _ssLastBuild = ts;
@@ -108,7 +109,7 @@ const INJECT_SNIPPET = `
 
   // Variation switcher widget
   (async () => {
-    const data = await fetch('/__ss__/variations').then(r => r.json());
+    const data = await fetch('${ssOrigin}/__ss__/variations').then(r => r.json());
     if (data.all.length < 2) return; // no switcher needed for a single variation
 
     const bar = document.createElement('div');
@@ -137,18 +138,19 @@ const INJECT_SNIPPET = `
 
     bar.querySelector('select').addEventListener('change', async (e) => {
       const v = e.target.value;
-      await fetch('/__ss__/switch?v=' + v);
+      await fetch('${ssOrigin}/__ss__/switch?v=' + v);
       // livereload will handle the refresh after esbuild rebuilds
     });
   })();
 </script>`;
+}
 
 /**
  * Inject our script snippet into an HTML string.
  * Processes HTML in segments, skipping <script> blocks to avoid breaking
  * inline JS that contains URL strings or </body> literals.
  */
-function injectIntoHtml(html, targetOrigin, localOrigin) {
+function injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET) {
   const escapedOrigin = targetOrigin.replace(
     /[.*+?^${}()|[\]\\]/g,
     "\\$&",
@@ -193,6 +195,7 @@ export async function startProxy(targetUrl, port = 3000, fetcherPage = null) {
 
   const targetOrigin = new URL(targetUrl).origin;
   const localOrigin = `http://localhost:${port}`;
+  const INJECT_SNIPPET = buildInjectSnippet(localOrigin);
 
   if (fetcherPage) {
     console.log("  ✔ Browser-based proxy active (Cloudflare bypass)");
@@ -406,7 +409,7 @@ export async function startProxy(targetUrl, port = 3000, fetcherPage = null) {
 
               if (contentType.includes("text/html")) {
                 let html = responseBuffer.toString("utf8");
-                return injectIntoHtml(html, targetOrigin, localOrigin);
+                return injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET);
               }
 
               return responseBuffer;
