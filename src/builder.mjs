@@ -114,30 +114,48 @@ export async function startBuilder(testName) {
   // caches file contents and doesn't reliably pick up changes on all systems.
   const { writeCacheEntry } = await import('./scaffold.mjs');
   const configPath = join(projectDir, '.ss-config.json');
-  let activeVariation = 'v1';
-  try {
-    activeVariation = JSON.parse(readFileSync(configPath, 'utf8')).activeVariation || 'v1';
-  } catch {}
 
-  const variationDir = join(projectDir, 'tests', testName, activeVariation);
-  console.log(`  [debug] Polling directory: ${variationDir}`);
-
-  function getSnapshot() {
-    const files = readdirSync(variationDir);
-    const snapshot = {};
-    for (const f of files) {
-      try { snapshot[f] = statSync(join(variationDir, f)).mtimeMs; } catch {}
+  function readActiveVariation() {
+    try {
+      return JSON.parse(readFileSync(configPath, 'utf8')).activeVariation || 'v1';
+    } catch {
+      return 'v1';
     }
-    return snapshot;
   }
 
-  let lastSnapshot = getSnapshot();
-  console.log(`  [debug] Initial snapshot:`, JSON.stringify(lastSnapshot));
+  let activeVariation = readActiveVariation();
+  let variationDir = join(projectDir, 'tests', testName, activeVariation);
+
+  function getSnapshot(dir) {
+    try {
+      const files = readdirSync(dir);
+      const snapshot = {};
+      for (const f of files) {
+        try { snapshot[f] = statSync(join(dir, f)).mtimeMs; } catch {}
+      }
+      return snapshot;
+    } catch {
+      return {};
+    }
+  }
+
+  let lastSnapshot = getSnapshot(variationDir);
 
   let rebuilding = false;
   setInterval(async () => {
     if (rebuilding) return;
-    const current = getSnapshot();
+
+    // Re-read config each cycle so variation switches are picked up
+    const currentVariation = readActiveVariation();
+    if (currentVariation !== activeVariation) {
+      console.log(`  ↻ Variation switched to ${currentVariation}`);
+      activeVariation = currentVariation;
+      variationDir = join(projectDir, 'tests', testName, activeVariation);
+      // Force a rebuild by resetting the snapshot
+      lastSnapshot = {};
+    }
+
+    const current = getSnapshot(variationDir);
     const lastKeys = Object.keys(lastSnapshot);
     const currentKeys = Object.keys(current);
 
@@ -146,7 +164,6 @@ export async function startBuilder(testName) {
       currentKeys.some((f) => lastSnapshot[f] !== current[f]);
 
     if (!changed) return;
-    console.log(`  [debug] Change detected:`, JSON.stringify(current));
 
     // Regenerate cache entry in case files were added or removed
     writeCacheEntry(testName, activeVariation);
