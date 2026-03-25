@@ -165,12 +165,16 @@ program
       const userDataDir = join(tmpdir(), `ss-chrome-${Date.now()}`);
 
       console.log('  Launching Chrome with DevTools protocol...');
+
+      // Launch Chrome to about:blank — NOT the target URL.
+      // We need to set up CDP (CSP bypass + init script) BEFORE navigating,
+      // otherwise the first page load misses our injections.
       const chromeProc = spawnProcess(chromePath, [
         `--remote-debugging-port=${debugPort}`,
         `--user-data-dir=${userDataDir}`,
         '--no-first-run',
         '--no-default-browser-check',
-        url,
+        'about:blank',
       ], { stdio: 'ignore', detached: false });
 
       // Clean up Chrome when the CLI exits
@@ -191,6 +195,12 @@ program
       const { chromium } = await import('playwright');
       const cdpBrowser = await chromium.connectOverCDP(`http://localhost:${debugPort}`);
       const cdpContext = cdpBrowser.contexts()[0];
+      const cdpPage = cdpContext.pages()[0];
+
+      // Bypass Content-Security-Policy so the real site allows our localhost scripts.
+      // This is a Chrome-level flag — no request interception needed.
+      const cdpSession = await cdpContext.newCDPSession(cdpPage);
+      await cdpSession.send('Page.setBypassCSP', { enabled: true });
 
       // Inject bundle loader + livereload on every page navigation.
       // This runs at document-start via CDP's Page.addScriptToEvaluateOnNewDocument.
@@ -217,7 +227,9 @@ program
         });
       `);
 
-      console.log('  ✔ Scripts will be injected after Cloudflare clears');
+      // NOW navigate to the target — init script is already registered
+      console.log('  ✔ CDP ready — navigating to target...');
+      await cdpPage.goto(url, { waitUntil: 'commit' }).catch(() => {});
       console.log('  ℹ Solve the security check in Chrome — your test loads automatically after.\n');
 
       // Start local server for /__ss__/* + builder + capture in parallel
