@@ -1,15 +1,18 @@
 {
   "name": "start-scripting",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local dev tool for building A/B tests on live websites",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nextafter-michael/start-scripting.git"
+  },
   "type": "module",
   "bin": {
     "ss": "./bin/ss.mjs"
   },
   "files": [
     "bin/",
-    "src/",
-    "tests/_template/"
+    "src/"
   ],
   "scripts": {
     "build": "node bin/ss.mjs build"
@@ -22,6 +25,7 @@
     "http-proxy-middleware": "^3.0.3",
     "playwright": "^1.50.1",
     "playwright-extra": "^4.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "ws": "^8.20.0"
   }
 }

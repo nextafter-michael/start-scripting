@@ -1,13 +1,13 @@
 # start-scripting
 
-Local dev tool for building A/B tests on live websites. Write test code in your IDE, see it run on the live site instantly.
+Local dev tool for building A/B tests on live websites. Write test code in your IDE against a live proxied site — CSS and HTML changes hot-swap instantly, JS changes reload in under a second.
 
 ## How it works
 
-1. `ss connect <url>` starts a proxy at `localhost:3000` that mirrors any live site
-2. Your local JS/CSS is automatically injected into every page
-3. Save a file → page rebuilds and refreshes instantly
-4. Page context (full-page screenshots at desktop/tablet/mobile + HTML + CSS) is saved to `ss-context/` so you can prompt your AI assistant (Copilot, Cursor, Claude, etc.) to generate test code
+1. `ss init` sets up a project, prompts for your first experience and variation
+2. `ss start` mirrors any live site at `localhost:3000` and injects your local code into every page
+3. Save a file → CSS/HTML hot-swaps; JS triggers an instant reload
+4. Page context (screenshots + cleaned HTML + CSS tokens) is saved to `.context/` for prompting your AI assistant
 
 ## Install
 
@@ -20,95 +20,132 @@ npm install
 npm link
 ```
 
-This installs the `ss` command globally. The first time you run `ss connect`, Chromium will be downloaded automatically (~100MB, one time).
+Or use the included helper scripts:
+
+```bash
+# Windows
+setup.bat
+
+# macOS / Linux
+./setup.sh
+```
+
+This installs the `ss` command globally. The first time you run `ss start`, Chromium will be downloaded automatically (~100MB, one time).
 
 ## Quickstart
 
 ```bash
-# Navigate to any project
-cd ~/projects/client-site/
+# Initialize a new project (prompts for URL, experience, and variation names)
+mkdir client-project && cd client-project
+ss init
 
-# Connect to a live site (auto-creates the test folder)
-ss connect https://client-site.com --test homepage-hero
+# Start the proxy (URL comes from config — no argument needed after init)
+ss start
 
 # localhost:3000 opens in your browser, mirroring the live site
-# Edit tests/homepage-hero/v1/variation.js — the page refreshes on every save
+# Edit experiences/<exp>/<variation>/<block>/modification.js — hot-reloads on save
 ```
-
-## AI-assisted development
-
-When `ss connect` runs, it saves context files to `ss-context/`:
-
-- `desktop.png` — full-page screenshot at 1440px
-- `tablet.png` — full-page screenshot at 768px
-- `mobile.png` — full-page screenshot at 375px
-- `page.md` — HTML structure + CSS design tokens
-
-Run `ss capture` at any time to refresh these files. Open `ss-context/page.md` in your IDE and ask your AI assistant:
-
-> "Based on ss-context/page.md, add a sticky announcement bar at the top that matches the site's colors"
-
-Paste the generated code into `v1/variation.js` → the proxy rebuilds → the change appears on the live site.
 
 ## Commands
 
 ```
-ss connect <url>               Start proxy + watcher for a live site
-ss connect <url> --test <name> Connect with a specific test name
-ss connect <url> --port <n>    Run on a custom port (default: 3000)
+ss init [dirname]              Initialize a new project directory
 
-ss new <test-name>             Create a new test folder manually
-ss variation                   Create a new variation for the active test
+ss new experience <name>       Create a new experience
+ss new variation <name>        Create a new variation for the active experience
+ss new block <name>            Create a modification block for the active variation
+
+ss start [url]                 Start proxy + watcher
+  --port, -p <number>          Port to run on (default: 3000)
+  --fresh                      Clear the resource cache before starting
+  --background, -b             Run as a background process (logs → .ss.log)
+
+ss stop                        Stop a background server
+
+ss list                        Show all experiences and variations
 ss capture [url]               Re-capture page context (screenshots + HTML)
-ss list                        Show all tests and which is active
-ss build                       Bundle all tests to dist/ for deployment
-
+ss build                       Bundle all experiences to dist/ (minified)
+ss cache clear                 Delete all cached resources (.cache/)
 ss man                         Show the full command reference
 ```
 
-## Test structure
-
-Each test lives in `tests/<name>/`:
+## Project structure
 
 ```
-tests/
+experiences/
   my-test/
-    v1/
-      variation.js ← write your code here (no wrapper needed)
-      index.css    ← styles (auto-injected as a <style> tag)
-      index.html   ← optional HTML injected before </body>
+    variation-1/
+      hero-copy/               ← modification block
+        modification.js        ← your code (plain JS, no wrapper needed)
+        modification.css       ← your styles
+        modification.html      ← optional HTML appended to <body>
+config.json                    ← active experience/variation + full schema (gitignored)
+.context/
+  screenshots/
+    desktop.png                ← 1440px full-page screenshot
+    tablet.png                 ← 768px
+    mobile.png                 ← 375px
+  content/
+    body.html                  ← cleaned HTML + CSS tokens for AI prompting
 ```
 
-`variation.js` is plain JavaScript — no function wrapper needed. The DOM is ready when it runs.
+`modification.js` is plain JavaScript — no function wrapper needed. The DOM is ready when it runs.
 
 ```js
-// variation.js example
+// modification.js example
 const hero = document.querySelector('.hero h1');
 if (hero) hero.textContent = 'New Headline';
 ```
 
-## Variations
+## AI-assisted development
 
-Run `ss variation` to create a new variation (v2, v3, ...) copied from the current one. The proxy switches to the new variation immediately.
+When `ss start` runs, it saves context files to `.context/`. Open `.context/content/body.html` in your IDE and ask your AI assistant (Copilot, Cursor, Claude, etc.):
 
-```bash
-ss variation
-# → creates tests/my-test/v2/, switches active variation to v2
-# → edit tests/my-test/v2/variation.js
+> "Based on `.context/content/body.html`, add a sticky announcement bar at the top that matches the site's colors"
+
+Paste the generated code into `modification.js` and `modification.css` — the proxy rebuilds and the change appears on the proxied site.
+
+Run `ss capture` at any time to refresh context files without restarting the proxy.
+
+## Live reload
+
+- **CSS changes** — the `<style>` tag is updated in-place; the page does not reload
+- **HTML changes** — injected nodes are replaced via DOM fragment; the page does not reload
+- **JS changes** — full page reload (JS side effects require a clean slate)
+
+All injected elements have a `data-ss-added` attribute so you can identify them in DevTools.
+
+## window.__ss
+
+Every proxied page exposes the current session state as a browser global:
+
+```js
+window.__ss = {
+  experience:    { name, slug },
+  variation:     { name, slug },
+  modifications: [{ name, slug, trigger }],
+  _nodes:        [],    // live references to HTML elements injected by ss
+  _ts:           null,  // timestamp of the last HTML injection
+  _applyHtml(html),     // re-inject variation HTML programmatically
+};
 ```
+
+## Variation switcher
+
+When more than one variation exists, a floating `<ss-floating-menu>` widget appears on the proxied page. Use it to switch between variations — the page reloads automatically. The widget uses a closed shadow root so host-page styles don't affect it.
 
 ## Optional HTML injection
 
-Add any HTML to `tests/<name>/<variation>/index.html` and it will be injected before `</body>` on every proxied page. Useful for modals, overlays, or any markup your test needs:
+Add HTML to a block's `modification.html` and it will be appended to `<body>` on every proxied page as bare elements (no wrapper div). Useful for modals, overlays, or any markup your test needs:
 
 ```html
-<!-- tests/my-test/v1/index.html -->
-<div id="ss-modal" style="display:none">
+<!-- modification.html -->
+<div id="my-modal" style="display:none">
   <h2>Special Offer</h2>
 </div>
 ```
 
-Leave the file empty (or delete it) if your test doesn't need extra HTML.
+Leave the file empty if your test doesn't need extra HTML.
 
 ## Deploying a test
 
@@ -117,32 +154,42 @@ ss build
 # → dist/my-test.js (minified, self-contained)
 ```
 
-Paste the contents of `dist/my-test.js` into your A/B testing platform (Optimizely, VWO, Convert, etc.) or load it via a `<script>` tag.
+Paste the contents of `dist/<exp>.js` into your A/B testing platform (Optimizely, VWO, Convert, etc.) or load it via a `<script>` tag.
+
+## Resource caching
+
+The proxy caches CSS, JS, images, and fonts from the live site to `.cache/`. Subsequent page loads and proxy restarts serve these from disk — making navigation faster during development.
+
+```bash
+ss start --fresh        # clear cache before starting
+ss cache clear          # clear cache without restarting
+```
+
+## Background mode
+
+Run the proxy in the background so your terminal stays free:
+
+```bash
+ss start --background   # starts server, prints PID
+ss stop                 # stops it
+tail -f .ss.log         # follow logs
+```
 
 ## Testing locally (contributing)
 
-To work on `ss` itself without reinstalling after every change:
-
 ```bash
-# 1. Clone the repo
-git clone https://github.com/garrett-a/start-scripting.git ~/projects/ss
-cd ~/projects/ss
-npm install
+# 1. Clone and link
+git clone https://github.com/garrett-a/start-scripting.git ~/.ss
+cd ~/.ss && npm install && npm link
 
-# 2. Link it globally so the `ss` command runs your local copy
-npm link
-
-# 3. Make a throwaway project to test against
+# 2. Make a throwaway project to test against
 mkdir /tmp/ss-test && cd /tmp/ss-test
+ss init
 
-# 4. Run commands directly from your clone — changes take effect immediately
-ss new my-test
-ss connect https://example.com --test my-test
+# Changes to src/ or bin/ take effect immediately — no reinstall needed
 ```
 
-Because `npm link` points the global `ss` binary at your clone, any edits to files in `src/` or `bin/` are picked up the next time you run a command — no reinstall needed.
-
-To unlink when you're done:
+To unlink when done:
 
 ```bash
 npm unlink -g start-scripting
@@ -152,4 +199,6 @@ npm unlink -g start-scripting
 
 ```bash
 cd ~/.ss && git pull && npm install
+# or
+cd ~/.ss && ./setup.sh
 ```

@@ -1,0 +1,177 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://nextafter.com/ss/config-schema.json",
+  "title": "start-scripting project config",
+  "description": "Schema for config.json files created by `ss init` in an ss project directory.",
+  "type": "object",
+  "required": ["active", "experiences", "settings"],
+  "additionalProperties": false,
+  "properties": {
+
+    "active": {
+      "description": "The currently active experience and variation. Written by ss start, ss new, and the variation switcher.",
+      "type": "object",
+      "required": ["experience", "variation"],
+      "additionalProperties": false,
+      "properties": {
+        "experience": {
+          "description": "Slug of the active experience.",
+          "type": ["string", "null"]
+        },
+        "variation": {
+          "description": "Slug of the active variation. 'control' means no modifications are injected.",
+          "type": ["string", "null"]
+        }
+      }
+    },
+
+    "experiences": {
+      "description": "All experiences defined in this project.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "slug", "pages", "variations"],
+        "additionalProperties": false,
+        "properties": {
+
+          "name": {
+            "description": "Human-readable display name (e.g. 'Homepage Hero Test').",
+            "type": "string",
+            "minLength": 1
+          },
+          "slug": {
+            "description": "Filesystem-safe identifier derived from name (e.g. 'homepage-hero-test'). Must match the directory name under experiences/.",
+            "type": "string",
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          },
+
+          "pages": {
+            "description": "URL targeting rules for this experience.",
+            "type": "object",
+            "required": ["editor", "include", "exclude"],
+            "additionalProperties": false,
+            "properties": {
+              "editor": {
+                "description": "The URL opened by ss start. Set automatically when you connect.",
+                "type": "string"
+              },
+              "include": {
+                "description": "URL patterns where the experience should run (supports wildcards, e.g. 'https://example.com/blog/*').",
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "exclude": {
+                "description": "URL patterns where the experience should NOT run even if matched by include.",
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          },
+
+          "variations": {
+            "description": "All variations for this experience. The Control variation is always first and has no directory.",
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["name", "slug"],
+              "additionalProperties": false,
+              "properties": {
+
+                "name": {
+                  "description": "Human-readable variation name (e.g. 'Control', 'Variation 1').",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "slug": {
+                  "description": "Filesystem-safe identifier. 'control' is reserved for the no-modification baseline.",
+                  "type": "string",
+                  "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+                },
+
+                "modifications": {
+                  "description": "Ordered list of modification blocks for this variation. Omitted or empty on the Control variation.",
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["name", "slug", "trigger", "resources"],
+                    "additionalProperties": false,
+                    "properties": {
+
+                      "name": {
+                        "description": "Human-readable block name (e.g. 'Hero Copy Change').",
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "slug": {
+                        "description": "Filesystem-safe identifier matching the block directory name.",
+                        "type": "string",
+                        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+                      },
+                      "trigger": {
+                        "description": "When the block's JS should execute relative to page lifecycle.",
+                        "type": "string",
+                        "enum": ["IMMEDIATE", "DOM_READY", "ELEMENT_LOADED", "CODE_BLOCK"],
+                        "default": "DOM_READY"
+                      },
+                      "resources": {
+                        "description": "Files to include from this block directory, in import order. CSS is imported before JS so styles register before code runs.",
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": ["modification.css", "modification.js", "modification.html"]
+                        },
+                        "uniqueItems": true
+                      }
+
+                    }
+                  }
+                }
+
+              }
+            }
+          },
+
+          "audiences": {
+            "description": "Targeting audience definitions (reserved for future use).",
+            "type": "array",
+            "items": { "type": "object" }
+          }
+
+        }
+      }
+    },
+
+    "settings": {
+      "description": "Project-level proxy and build settings.",
+      "type": "object",
+      "required": ["cache_ttl", "timeout_ms", "spa", "ssr"],
+      "additionalProperties": false,
+      "properties": {
+        "cache_ttl": {
+          "description": "How long (in seconds) proxied static assets are served from .cache/ before re-fetching.",
+          "type": "integer",
+          "minimum": 0,
+          "default": 3600
+        },
+        "timeout_ms": {
+          "description": "Page load timeout in milliseconds for the Playwright bot-detection probe and capture.",
+          "type": "integer",
+          "minimum": 0,
+          "default": 30000
+        },
+        "spa": {
+          "description": "Enable single-page-app mode (re-applies modifications on client-side route changes). Reserved for future use.",
+          "type": "boolean",
+          "default": false
+        },
+        "ssr": {
+          "description": "Hint that the target site uses server-side rendering (affects HTML injection strategy). Reserved for future use.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+
+  }
+}

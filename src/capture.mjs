@@ -2,17 +2,18 @@
  * capture.mjs — Page context capture
  *
  * Called automatically when `ss connect` runs. Uses Playwright to visit the
- * live site and save context files to ss-context/ in the current project:
+ * live site and save context files to .context/ in the current project:
  *
- *   ss-context/desktop.png     — full-page screenshot at 1440px
- *   ss-context/tablet.png      — full-page screenshot at 768px
- *   ss-context/mobile.png      — full-page screenshot at 375px
- *   ss-context/page.md         — HTML structure + CSS tokens in markdown,
- *                                readable by any AI assistant (Copilot, Cursor,
- *                                Claude, etc.)
+ *   .context/screenshots/desktop.png  — full-page screenshot at 1440px
+ *   .context/screenshots/tablet.png   — full-page screenshot at 768px
+ *   .context/screenshots/mobile.png   — full-page screenshot at 375px
+ *   .context/content/body.html        — cleaned page body HTML + CSS tokens,
+ *                                       readable by any AI assistant (Copilot,
+ *                                       Cursor, Claude, etc.)
  *
- * The user can then ask their IDE's AI: "Based on ss-context/page.md, add a
- * sticky bar that matches the site's colors" and paste the output into variation.js.
+ * The user can then ask their IDE's AI: "Based on .context/content/body.html,
+ * add a sticky bar that matches the site's colors" and paste the output into
+ * variation.js.
  */
 
 import { chromium } from 'playwright';
@@ -31,9 +32,13 @@ const TOOL_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
  * @param {object} [options]
  * @param {Array}  [options.cookies] - Cookies to inject (e.g. CF clearance from PwFetcher)
  */
-export async function capturePageContext(targetUrl, testName, { cookies } = {}) {
-  const contextDir = join(process.cwd(), 'ss-context');
-  mkdirSync(contextDir, { recursive: true });
+export async function capturePageContext(targetUrl, expSlug, { cookies } = {}) {
+  const testName = expSlug; // kept for internal use in body.html comment
+  const contextDir = join(process.cwd(), '.context');
+  const screenshotsDir = join(contextDir, 'screenshots');
+  const contentDir = join(contextDir, 'content');
+  mkdirSync(screenshotsDir, { recursive: true });
+  mkdirSync(contentDir, { recursive: true });
 
   console.log(`\n🔍 Capturing page context from ${targetUrl}...`);
 
@@ -89,7 +94,7 @@ export async function capturePageContext(targetUrl, testName, { cookies } = {}) 
     await page.setViewportSize({ width: vp.width, height: vp.height });
     await page.waitForTimeout(300); // let layout settle after resize
     await page.screenshot({
-      path: join(contextDir, `${vp.name}.png`),
+      path: join(screenshotsDir, `${vp.name}.png`),
       fullPage: true,
     });
     console.log(`  ✔ ${vp.name}.png (${vp.width}px)`);
@@ -139,44 +144,29 @@ export async function capturePageContext(targetUrl, testName, { cookies } = {}) 
   const pageTitle = await page.title();
   await browser.close();
 
-  // Build page.md — the main context file for the AI assistant
+  // Build body.html — the main context file for the AI assistant
   const cssTokenLines = Object.entries(tokens)
     .map(([k, v]) => `  ${k}: ${v}`)
     .join('\n');
 
-  const md = [
-    `# Page Context: ${pageTitle}`,
+  const bodyContent = [
+    `<!-- Page Context: ${pageTitle}`,
+    `     URL: ${targetUrl}`,
+    `     Active experience: experiences/${testName}/`,
+    `     Screenshots: .context/screenshots/ (desktop.png, tablet.png, mobile.png)`,
+    `-->`,
     ``,
-    `**URL:** ${targetUrl}`,
-    `**Active test:** tests/${testName}/`,
+    `<!--`,
+    `CSS Design Tokens`,
+    `${cssTokenLines || '(none found)'}`,
+    `-->`,
     ``,
-    `## Screenshots`,
-    `- **Desktop (1440px):** ss-context/desktop.png`,
-    `- **Tablet (768px):** ss-context/tablet.png`,
-    `- **Mobile (375px):** ss-context/mobile.png`,
-    ``,
-    `## How to use this file`,
-    `Ask your AI assistant (Copilot, Cursor, Claude, etc.):`,
-    `> "Based on the context in ss-context/page.md, [what you want to build]"`,
-    ``,
-    `Then paste the generated JS into \`tests/${testName}/v1/variation.js\``,
-    `and the CSS into \`tests/${testName}/v1/index.css\`.`,
-    `The proxy will rebuild and show the change on the live site automatically.`,
-    ``,
-    `## CSS Design Tokens`,
-    `\`\`\``,
-    cssTokenLines || '(none found)',
-    `\`\`\``,
-    ``,
-    `## Page Body`,
-    `\`\`\`html`,
     bodyHtml,
-    `\`\`\``,
   ].join('\n');
 
-  writeFileSync(join(contextDir, 'page.md'), md);
+  writeFileSync(join(contentDir, 'body.html'), bodyContent);
 
-  console.log(`✔ Context saved to ss-context/`);
-  console.log(`  desktop.png, tablet.png, mobile.png — full-page screenshots`);
-  console.log(`  page.md — reference this file when prompting your AI\n`);
+  console.log(`✔ Context saved to .context/`);
+  console.log(`  screenshots/desktop.png, tablet.png, mobile.png — full-page screenshots`);
+  console.log(`  content/body.html — reference this file when prompting your AI\n`);
 }

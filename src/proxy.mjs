@@ -15,6 +15,7 @@
  */
 
 import express from "express";
+import { WebSocketServer } from "ws";
 import {
   createProxyMiddleware,
   responseInterceptor,
@@ -22,14 +23,12 @@ import {
 import {
   readFileSync,
   writeFileSync,
+  mkdirSync,
   existsSync,
-  readdirSync,
-  statSync,
 } from "fs";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { join, dirname, extname } from "path";
 
-const CONFIG_FILE = join(process.cwd(), ".ss-config.json");
+const CONFIG_FILE = join(process.cwd(), "config.json");
 
 function loadConfig() {
   try {
@@ -44,45 +43,168 @@ function saveConfig(data) {
 }
 
 /**
- * Read the active variation's index.html and return its content if it has
- * real HTML (not just the placeholder comment). Re-reads config each call
- * so switching variations takes effect on the next page load.
+ * Concatenate HTML from all modification blocks for the active variation,
+ * in config.json order. Re-reads config each call so switching variations
+ * takes effect on the next page load.
  */
 function loadVariationHtml() {
   const config = loadConfig();
-  const { activeTest, activeVariation = "v1" } = config;
-  if (!activeTest) return "";
-  const htmlPath = join(
-    process.cwd(),
-    "tests",
-    activeTest,
-    activeVariation,
-    "index.html",
-  );
-  if (!existsSync(htmlPath)) return "";
-  const raw = readFileSync(htmlPath, "utf8");
-  // Only inject if there's real content beyond HTML comments
-  const stripped = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
-  return stripped ? raw.trim() : "";
+  const expSlug = config.active?.experience;
+  const varSlug = config.active?.variation;
+  if (!expSlug || !varSlug) return "";
+
+  const exp = config.experiences?.find((e) => e.slug === expSlug);
+  const variation = exp?.variations?.find((v) => v.slug === varSlug);
+  if (!variation?.modifications?.length) return "";
+
+  const parts = [];
+  for (const mod of variation.modifications) {
+    if (!mod?.slug) continue; // guard against malformed config entries
+    const htmlPath = join(
+      process.cwd(),
+      "experiences",
+      expSlug,
+      varSlug,
+      mod.slug,
+      "modification.html",
+    );
+    if (!existsSync(htmlPath)) continue;
+    const raw = readFileSync(htmlPath, "utf8");
+    const stripped = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
+    if (stripped) parts.push(raw.trim());
+  }
+  return parts.join("\n");
 }
 
 /**
- * List all v# folders for the active test.
+ * List all variations for the active experience, read from config.json.
+ * Returns { active: slug, all: [{ name, slug }, ...] }
  */
 function listVariations() {
   const config = loadConfig();
-  if (!config.activeTest) return { active: "v1", all: [] };
-  const testDir = join(process.cwd(), "tests", config.activeTest);
-  if (!existsSync(testDir))
-    return { active: config.activeVariation || "v1", all: [] };
-  const all = readdirSync(testDir)
-    .filter((n) => /^v\d+$/.test(n) && statSync(join(testDir, n)).isDirectory())
-    .sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10));
-  return { active: config.activeVariation || "v1", all };
+  const expSlug = config.active?.experience;
+  if (!expSlug) return { active: null, all: [] };
+
+  const exp = config.experiences?.find((e) => e.slug === expSlug);
+  if (!exp) return { active: config.active?.variation, all: [] };
+
+  const all = (exp.variations || []).map((v) => ({ name: v.name, slug: v.slug }));
+  return { active: config.active?.variation, all };
 }
 
 // DIST_DIR lives in the user's current project, not the tool install
 const DIST_DIR = join(process.cwd(), "dist");
+
+/**
+ * Build a <script> block that sets window.__ss with the current session state.
+ * Called per-request so it always reflects the active experience/variation.
+ */
+function buildWindowSsBlock() {
+  const config = loadConfig();
+  const expSlug = config.active?.experience;
+  const varSlug = config.active?.variation;
+  const exp = config.experiences?.find((e) => e.slug === expSlug);
+  const variation = exp?.variations?.find((v) => v.slug === varSlug);
+
+  const data = {
+    experience: exp ? { name: exp.name, slug: exp.slug } : null,
+    variation:  variation ? { name: variation.name, slug: variation.slug } : null,
+    modifications: (variation?.modifications || [])
+      .filter((m) => m?.slug)
+      .map((m) => ({ name: m.name, slug: m.slug, trigger: m.trigger })),
+  };
+
+  // JSON carries the data; the non-serialisable parts (_applyHtml etc.) are
+  // appended as plain JS so they're available before the HTML-init script runs.
+  return `<script type="text/javascript" data-ss-added="config">
+window.__ss = ${JSON.stringify(data)};
+window.__ss._nodes = [];
+window.__ss._ts    = null;
+
+// Apply (or re-apply) variation HTML nodes directly onto document.body.
+// Removes any nodes from a previous call, parses the new HTML string into a
+// DocumentFragment, stamps each top-level element with data-ss-added="<ts>",
+// appends them to body, and stores live references in window.__ss._nodes.
+window.__ss._applyHtml = function(html) {
+  (window.__ss._nodes || []).forEach(function(n) { if (n.parentNode) n.parentNode.removeChild(n); });
+  window.__ss._nodes = [];
+  if (!html) return;
+  var tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  var ts = String(Date.now());
+  window.__ss._nodes = Array.from(tpl.content.children).map(function(el) {
+    el.setAttribute('data-ss-added', ts);
+    document.body.appendChild(el);
+    return el;
+  });
+  window.__ss._ts = ts;
+};
+</script>`;
+}
+
+// ─── Local resource cache ─────────────────────────────────────────────────────
+
+const CACHE_DIR = join(process.cwd(), ".cache");
+
+// Extension → Content-Type for serving cached files without a live response
+const CACHE_CONTENT_TYPES = {
+  ".css":  "text/css",
+  ".js":   "application/javascript",
+  ".mjs":  "application/javascript",
+  ".png":  "image/png",
+  ".jpg":  "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif":  "image/gif",
+  ".webp": "image/webp",
+  ".avif": "image/avif",
+  ".svg":  "image/svg+xml",
+  ".ico":  "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2":"font/woff2",
+  ".ttf":  "font/ttf",
+  ".otf":  "font/otf",
+  ".eot":  "application/vnd.ms-fontobject",
+};
+
+/**
+ * Map a URL path to a cache file path.
+ * Strips query strings and sanitises against path traversal.
+ * Returns null if the path is unsafe or has no cacheable extension.
+ */
+function getCachePath(urlPath) {
+  const clean = urlPath.split("?")[0].split("#")[0];
+  if (!CACHE_CONTENT_TYPES[extname(clean).toLowerCase()]) return null;
+  // Strip leading slashes and collapse any .. segments to prevent traversal
+  const rel = clean.replace(/^[/\\]+/, "").replace(/\.\./g, "_");
+  if (!rel) return null;
+  return join(CACHE_DIR, rel);
+}
+
+/**
+ * Returns true for content types worth caching (non-HTML static assets).
+ */
+function isCacheable(contentType) {
+  return (
+    contentType.startsWith("text/css") ||
+    contentType.includes("javascript") ||
+    contentType.startsWith("image/") ||
+    contentType.startsWith("font/") ||
+    contentType.startsWith("application/font")
+  );
+}
+
+/**
+ * Write a response buffer to the cache, silently skipping on any error.
+ * Only writes on a cache miss so we never overwrite a previously cached file.
+ */
+function writeToCache(urlPath, buffer) {
+  const cachePath = getCachePath(urlPath);
+  if (!cachePath || existsSync(cachePath)) return;
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true });
+    writeFileSync(cachePath, buffer);
+  } catch (_) {}
+}
 
 /**
  * Build the HTML snippet injected into every proxied page.
@@ -93,55 +215,99 @@ const DIST_DIR = join(process.cwd(), "dist");
  * @param {string} ssOrigin - The proxy origin, e.g. "http://localhost:3000"
  */
 function buildInjectSnippet(ssOrigin) {
+  const wsUrl = ssOrigin.replace(/^http/, 'ws') + '/__ss__/ws';
   return `
-<script src="${ssOrigin}/__ss__/bundle.js"></script>
-<script>
-  // Livereload: poll for changes and refresh when a new build is ready
-  let _ssLastBuild = null;
-  setInterval(async () => {
-    try {
-      const r = await fetch('${ssOrigin}/__ss__/.reload?t=' + Date.now());
-      const ts = await r.text();
-      if (_ssLastBuild !== null && ts !== _ssLastBuild) location.reload();
-      _ssLastBuild = ts;
-    } catch (_) {}
-  }, 1000);
-
-  // Variation switcher widget
-  (async () => {
-    const data = await fetch('${ssOrigin}/__ss__/variations').then(r => r.json());
-    if (data.all.length < 2) return; // no switcher needed for a single variation
-
-    const bar = document.createElement('div');
-    bar.id = '__ss_switcher';
-    bar.innerHTML = \`
-      <style>
-        #__ss_switcher {
-          position: fixed; top: 50%; left: 4px; z-index: 2147483647;
-          font: 13px/1.4 -apple-system, system-ui, sans-serif;
-          background: #1a1a2e; color: #eee; border-radius: 8px;
-          padding: 6px 10px; display: flex; align-items: center; gap: 8px;
-          box-shadow: 0 2px 12px rgba(0,0,0,.35); user-select: none;
-        }
-        #__ss_switcher select {
-          background: #2d2d44; color: #fff; border: 1px solid #444;
-          border-radius: 4px; padding: 2px 6px; font: inherit; cursor: pointer;
-        }
-        #__ss_switcher .label { opacity: 0.6; font-size: 11px; }
-      </style>
-      <span class="label">ss</span>
-      <select>\${data.all.map(v =>
-        '<option value="' + v + '"' + (v === data.active ? ' selected' : '') + '>' + v + '</option>'
-      ).join('')}</select>
-    \`;
-    document.body.appendChild(bar);
-
-    bar.querySelector('select').addEventListener('change', async (e) => {
-      const v = e.target.value;
-      await fetch('${ssOrigin}/__ss__/switch?v=' + v);
-      // livereload will handle the refresh after esbuild rebuilds
-    });
+<script type="text/javascript" src="${ssOrigin}/__ss__/bundle.js" data-ss-added="bundle"></script>
+<script type="text/javascript" data-ss-added="runtime">
+  // ── WebSocket live-reload ──────────────────────────────────────────────────
+  (function connectSs() {
+    const ws = new WebSocket('${wsUrl}');
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'reload') {
+        location.reload();
+      } else if (msg.type === 'css-update') {
+        const el = document.getElementById('__ss_styles');
+        if (el) el.textContent = msg.css;
+        else location.reload();
+      } else if (msg.type === 'html-update') {
+        window.__ss._applyHtml(msg.html);
+      }
+    };
+    ws.onclose = () => setTimeout(connectSs, 1000);
   })();
+
+  // ── <ss-floating-menu> web component ──────────────────────────────────────
+  // Closed shadow root keeps all internal styles isolated from the host page.
+  class SsFloatingMenu extends HTMLElement {
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'closed' });
+    }
+    async connectedCallback() {
+      const data = await fetch('${ssOrigin}/__ss__/variations').then(r => r.json());
+      if (!data.all || data.all.length < 2) return; // nothing to switch between
+
+      this._root.innerHTML = \`
+        <style>
+          :host {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            position: fixed;
+            top: 50%;
+            left: 4px;
+            z-index: 2147483647;
+            transform: translateY(-50%);
+            font: 13px/1.4 -apple-system, system-ui, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            border-radius: 8px;
+            padding: 6px 10px;
+            box-shadow: 0 2px 12px rgba(0,0,0,.4);
+            user-select: none;
+          }
+          .label {
+            opacity: 0.5;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+          }
+          select {
+            background: #2d2d44;
+            color: #fff;
+            border: 1px solid #444;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font: inherit;
+            cursor: pointer;
+          }
+          select:focus { outline: none; border-color: #7c7cff; }
+        </style>
+        <span class="label">ss</span>
+        <select>\${
+          data.all.map(v =>
+            '<option value="' + v.slug + '"' +
+            (v.slug === data.active ? ' selected' : '') +
+            '>' + v.name + '</option>'
+          ).join('')
+        }</select>
+      \`;
+
+      this._root.querySelector('select').addEventListener('change', async (e) => {
+        const slug = e.target.value;
+        await fetch('${ssOrigin}/__ss__/switch?v=' + slug);
+        // The server broadcasts a reload after switching; the WS handler above
+        // will call location.reload() — no need to reload here too.
+      });
+    }
+  }
+
+  if (!customElements.get('ss-floating-menu')) {
+    customElements.define('ss-floating-menu', SsFloatingMenu);
+  }
+  document.body.appendChild(document.createElement('ss-floating-menu'));
 </script>`;
 }
 
@@ -151,22 +317,27 @@ function buildInjectSnippet(ssOrigin) {
  * inline JS that contains URL strings or </body> literals.
  */
 function injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET) {
-  const escapedOrigin = targetOrigin.replace(
-    /[.*+?^${}()|[\]\\]/g,
-    "\\$&",
-  );
+  const escapedOrigin = targetOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const originRe = new RegExp(`(=["'])${escapedOrigin}`, "gi");
   const scriptRe = /(<script[\s\S]*?<\/script>)/gi;
 
   const variationHtml = loadVariationHtml();
-  const fullSnippet =
-    (variationHtml ? variationHtml + "\n" : "") + INJECT_SNIPPET;
+  // Build a per-request init script that calls _applyHtml (defined in the
+  // window.__ss block above) with the server-rendered variation HTML string.
+  // This runs immediately since we're just before </body> and the DOM is live.
+  const htmlInitScript = variationHtml
+    ? `<script type="text/javascript" data-ss-added="html-init">window.__ss._applyHtml(${JSON.stringify(variationHtml)});</script>`
+    : '';
+
+  const fullSnippet = buildWindowSsBlock() + "\n"
+    + (htmlInitScript ? htmlInitScript + "\n" : "")
+    + INJECT_SNIPPET;
 
   let injected = false;
   html = html
     .split(scriptRe)
     .map((part, i) => {
-      if (i % 2 !== 0) return part;
+      if (i % 2 !== 0) return part; // skip script blocks
       let out = part.replace(originRe, `$1${localOrigin}`);
       if (!injected && /<\/body>/i.test(out)) {
         out = out.replace(/<\/body>/i, fullSnippet + "\n</body>");
@@ -183,23 +354,24 @@ function injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET) {
 /**
  * Start the proxy server.
  *
- * @param {string} targetUrl    - The live site to mirror (e.g. "https://client.com")
- * @param {number} port         - Local port to run on (default 3000)
- * @param {object} [options]    - Optional settings
- * @param {boolean} [options.localOnly] - If true, only serve /__ss__/* routes (no proxy).
- *                                        Used in CDP mode where Chrome loads the site directly.
- * @returns {Promise<void>}     - Resolves once the server is up and listening
+ * @param {string} targetUrl - The live site to mirror (e.g. "https://client.com")
+ * @param {number} port      - Local port to run on (default 3000)
+ * @param {object} [options]
+ * @param {object} [options.pwFetcher] - PwFetcher instance for Cloudflare bypass
+ * @returns {Promise<Function>} - Resolves with the broadcast() function
  */
 export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = {}) {
   const app = express();
 
   const targetOrigin = new URL(targetUrl).origin;
-  const localOrigin = `http://localhost:${port}`;
+  const localOrigin  = `http://localhost:${port}`;
   const INJECT_SNIPPET = buildInjectSnippet(localOrigin);
 
-  // Allow cross-origin requests to /__ss__/* endpoints.
-  // In CDP mode, the page runs on the real domain (e.g. https://example.com)
-  // and fetches bundle/livereload from http://localhost — CORS is required.
+  // Placeholder replaced once the WebSocket server is ready (after app.listen).
+  // Defined here so all route handlers below can close over it.
+  let broadcast = (_msg) => {};
+
+  // Allow cross-origin requests to /__ss__/* endpoints
   app.use("/__ss__", (req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Private-Network", "true");
@@ -207,87 +379,109 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
     next();
   });
 
-  /**
-   * ROUTE 1: Serve the compiled bundle
-   */
-  app.get("/__ss__/bundle.js", (req, res) => {
+  // ── ROUTE 1: Compiled bundle ─────────────────────────────────────────────
+  app.get("/__ss__/bundle.js", (_req, res) => {
     const bundlePath = join(DIST_DIR, "bundle.js");
+    res.setHeader("Content-Type", "application/javascript");
+    res.setHeader("Cache-Control", "no-store");
     if (existsSync(bundlePath)) {
-      res.setHeader("Content-Type", "application/javascript");
-      res.setHeader("Cache-Control", "no-store");
       res.send(readFileSync(bundlePath));
     } else {
-      res.setHeader("Content-Type", "application/javascript");
-      res
-        .status(200)
-        .send("// [ss] bundle not built yet — save a file to trigger a build");
+      res.status(200).send("// [ss] bundle not built yet — save a file to trigger a build");
     }
   });
 
-  /**
-   * ROUTE 2: Serve the livereload signal file
-   */
-  app.get("/__ss__/.reload", (req, res) => {
-    const reloadPath = join(DIST_DIR, ".reload");
-    res.setHeader("Content-Type", "text/plain");
-    res.send(existsSync(reloadPath) ? readFileSync(reloadPath, "utf8") : "0");
-  });
-
-  /**
-   * ROUTE 3: List available variations (JSON)
-   */
-  app.get("/__ss__/variations", (req, res) => {
+  // ── ROUTE 2: Variation list ──────────────────────────────────────────────
+  app.get("/__ss__/variations", (_req, res) => {
     res.json(listVariations());
   });
 
-  /**
-   * ROUTE 4: Switch active variation
-   */
+  // ── ROUTE 3: Session state (mirrors window.__ss) ─────────────────────────
+  app.get("/__ss__/config", (_req, res) => {
+    const config = loadConfig();
+    const expSlug = config.active?.experience;
+    const varSlug = config.active?.variation;
+    const exp = config.experiences?.find((e) => e.slug === expSlug);
+    const variation = exp?.variations?.find((v) => v.slug === varSlug);
+    res.json({
+      experience:    exp       ? { name: exp.name,       slug: exp.slug       } : null,
+      variation:     variation ? { name: variation.name, slug: variation.slug } : null,
+      modifications: (variation?.modifications || [])
+        .filter((m) => m?.slug)
+        .map((m) => ({ name: m.name, slug: m.slug, trigger: m.trigger })),
+    });
+  });
+
+  // ── ROUTE 4: Switch active variation ─────────────────────────────────────
   app.get("/__ss__/switch", async (req, res) => {
-    const v = req.query.v;
-    if (!v) return res.status(400).json({ error: "Missing ?v= parameter" });
+    const varSlug = req.query.v;
+    if (!varSlug) return res.status(400).json({ error: "Missing ?v= parameter" });
 
     const config = loadConfig();
-    if (!config.activeTest)
-      return res.status(400).json({ error: "No active test" });
+    const expSlug = config.active?.experience;
+    if (!expSlug) return res.status(400).json({ error: "No active experience" });
 
-    const testDir = join(process.cwd(), "tests", config.activeTest);
-    const variationDir = join(testDir, v);
-    if (!existsSync(variationDir))
-      return res.status(404).json({ error: `${v} not found` });
+    const exp = config.experiences?.find((e) => e.slug === expSlug);
+    const variation = exp?.variations?.find((v) => v.slug === varSlug);
+    if (!variation) return res.status(404).json({ error: `${varSlug} not found in config` });
+
+    // Control is JSON-only (no directory); all other variations must have a dir
+    if (varSlug !== "control") {
+      const varDir = join(process.cwd(), "experiences", expSlug, varSlug);
+      if (!existsSync(varDir))
+        return res.status(404).json({ error: `${varSlug} directory not found` });
+    }
 
     const { writeCacheEntry } = await import("./scaffold.mjs");
-    writeCacheEntry(config.activeTest, v);
-    saveConfig({ ...config, activeVariation: v });
+    writeCacheEntry(expSlug, varSlug);
 
-    console.log(`  ↻ Switched to ${v}`);
-    res.json({ ok: true, active: v });
+    if (!config.active) config.active = {};
+    config.active.variation = varSlug;
+    saveConfig(config);
+
+    // Always broadcast a reload — the builder's file watcher only fires when a
+    // source file changes, so switching (especially to/from Control) requires an
+    // explicit push here.
+    broadcast({ type: "reload" });
+
+    console.log(`  ↻ Switched to ${varSlug}`);
+    res.json({ ok: true, active: varSlug });
+  });
+
+  // ── MIDDLEWARE: Local resource cache ─────────────────────────────────────
+  app.use((req, res, next) => {
+    if (req.method !== "GET") return next();
+    const cachePath = getCachePath(req.path);
+    if (!cachePath || !existsSync(cachePath)) return next();
+
+    const ext = extname(req.path).toLowerCase();
+    const contentType = CACHE_CONTENT_TYPES[ext];
+    res.setHeader("Cache-Control", "public, max-age=3600");
+
+    if (ext === ".css") {
+      const css = readFileSync(cachePath, "utf8").split(targetOrigin).join(localOrigin);
+      res.setHeader("Content-Type", "text/css");
+      return res.send(css);
+    }
+
+    res.setHeader("Content-Type", contentType);
+    res.send(readFileSync(cachePath));
   });
 
   if (pwFetcher) {
-    /**
-     * MIDDLEWARE: Playwright-backed proxy (for Cloudflare-protected sites)
-     *
-     * HTML requests are fetched via Playwright's real browser engine (which
-     * passes CF bot detection), then served with a <base href> so sub-resources
-     * resolve to the real domain. Non-HTML requests are 302'd to the real site
-     * so the user's browser fetches them directly (real browsers pass CF fine).
-     */
+    // ── MIDDLEWARE: Playwright-backed proxy (Cloudflare bypass) ─────────────
     app.use(async (req, res) => {
-      const accept = req.headers["accept"] || "";
+      const accept  = req.headers["accept"] || "";
       const fullUrl = targetOrigin + req.originalUrl;
 
       if (accept.includes("text/html")) {
         try {
           console.log(`  [PW] ${req.method} ${req.url}`);
           let html = await pwFetcher.fetchPage(fullUrl);
-          // Insert <base href> so relative URLs resolve to the real domain
           const baseTag = `<base href="${targetOrigin}/">`;
-          if (/<head[^>]*>/i.test(html)) {
-            html = html.replace(/(<head[^>]*>)/i, `$1\n${baseTag}`);
-          } else {
-            html = baseTag + "\n" + html;
-          }
+          html = /<head[^>]*>/i.test(html)
+            ? html.replace(/(<head[^>]*>)/i, `$1\n${baseTag}`)
+            : baseTag + "\n" + html;
           html = injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET);
           res.setHeader("Content-Type", "text/html; charset=utf-8");
           res.setHeader("Cache-Control", "no-store");
@@ -297,14 +491,11 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
           res.status(502).send("Proxy error: " + err.message);
         }
       } else {
-        // Non-HTML: redirect to real domain so browser fetches directly
         res.redirect(302, fullUrl);
       }
     });
   } else {
-    /**
-     * MIDDLEWARE: Standard http-proxy-middleware (for sites without bot protection)
-     */
+    // ── MIDDLEWARE: Standard http-proxy-middleware ─────────────────────────
     app.use(
       createProxyMiddleware({
         target: targetUrl,
@@ -312,23 +503,17 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
         selfHandleResponse: true,
         on: {
           proxyRes: responseInterceptor(
-            async (responseBuffer, proxyRes, req, res) => {
+            async (responseBuffer, proxyRes, req) => {
               const status = proxyRes.statusCode;
-              const loc = proxyRes.headers["location"];
-              if (loc) {
-                console.log(`  [${status}] ${req.url} → ${loc}`);
-              } else {
-                console.log(`  [${status}] ${req.url}`);
-              }
+              const loc    = proxyRes.headers["location"];
+              console.log(loc ? `  [${status}] ${req.url} → ${loc}` : `  [${status}] ${req.url}`);
 
-              const location = proxyRes.headers["location"];
-              if (location) {
-                if (location.startsWith("/")) {
-                  proxyRes.headers["location"] =
-                    `http://localhost:${port}${location}`;
+              if (loc) {
+                if (loc.startsWith("/")) {
+                  proxyRes.headers["location"] = `http://localhost:${port}${loc}`;
                 } else {
                   try {
-                    const u = new URL(location);
+                    const u = new URL(loc);
                     u.protocol = "http:";
                     u.host = `localhost:${port}`;
                     proxyRes.headers["location"] = u.toString();
@@ -348,15 +533,20 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
               const contentType = proxyRes.headers["content-type"] || "";
 
               if (contentType.includes("text/css")) {
-                const css = responseBuffer.toString("utf8");
-                return css.split(targetOrigin).join(localOrigin);
+                writeToCache(req.path, responseBuffer);
+                return responseBuffer.toString("utf8").split(targetOrigin).join(localOrigin);
               }
 
               if (contentType.includes("text/html")) {
-                let html = responseBuffer.toString("utf8");
-                return injectIntoHtml(html, targetOrigin, localOrigin, INJECT_SNIPPET);
+                return injectIntoHtml(
+                  responseBuffer.toString("utf8"),
+                  targetOrigin,
+                  localOrigin,
+                  INJECT_SNIPPET,
+                );
               }
 
+              if (isCacheable(contentType)) writeToCache(req.path, responseBuffer);
               return responseBuffer;
             },
           ),
@@ -366,10 +556,23 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
   }
 
   return new Promise((resolve) => {
-    app.listen(port, () => {
+    const server = app.listen(port, () => {
       console.log(`\n✔ Proxy running → http://localhost:${port}`);
       console.log(`  Mirroring: ${targetUrl}\n`);
-      resolve();
+      resolve(broadcast);
     });
+
+    // WebSocket server — shares the same HTTP server, handles /__ss__/ws upgrades.
+    // Upgrade the broadcast placeholder once the WSS is ready.
+    const wss = new WebSocketServer({ server, path: "/__ss__/ws" });
+
+    broadcast = (msg) => {
+      const data = JSON.stringify(msg);
+      for (const client of wss.clients) {
+        if (client.readyState === 1 /* OPEN */) {
+          try { client.send(data); } catch (_) {}
+        }
+      }
+    };
   });
 }
