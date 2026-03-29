@@ -1,5 +1,12 @@
 node_modules/
 dist/
-.ss-cache/
+demo/
+config.json
+.context/
+.cache/
 .env
-.ss-config.json
+*.DS_Store
+*.log
+*.local.*
+TODO.md
+ROADMAP.md
