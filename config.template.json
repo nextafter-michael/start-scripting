@@ -56,14 +56,14 @@
                 "type": "string"
               },
               "include": {
-                "description": "URL patterns where the experience should run (supports wildcards, e.g. 'https://example.com/blog/*').",
+                "description": "URL targeting rules that determine where the experience runs.",
                 "type": "array",
-                "items": { "type": "string" }
+                "items": { "$ref": "#/$defs/pageRule" }
               },
               "exclude": {
-                "description": "URL patterns where the experience should NOT run even if matched by include.",
+                "description": "URL targeting rules that prevent the experience from running even if an include rule matches.",
                 "type": "array",
-                "items": { "type": "string" }
+                "items": { "$ref": "#/$defs/pageRule" }
               }
             }
           },
@@ -111,15 +111,28 @@
                       "trigger": {
                         "description": "When the block's JS should execute relative to page lifecycle.",
                         "type": "string",
-                        "enum": ["IMMEDIATE", "DOM_READY", "ELEMENT_LOADED", "CODE_BLOCK"],
+                        "enum": ["IMMEDIATE", "DOM_READY", "ELEMENT_LOADED", "AFTER_CODE_BLOCK"],
                         "default": "DOM_READY"
                       },
+                      "selector": {
+                        "description": "CSS selector to wait for (ELEMENT_LOADED only). The block fires when a matching element is added to the DOM.",
+                        "type": "string"
+                      },
+                      "once": {
+                        "description": "For ELEMENT_LOADED: fire only the first time the selector matches (true) or every time a new match is added (false). Defaults to true.",
+                        "type": "boolean",
+                        "default": true
+                      },
+                      "dependency": {
+                        "description": "Slug of another block in the same variation that must run first (AFTER_CODE_BLOCK only).",
+                        "type": "string"
+                      },
                       "resources": {
-                        "description": "Files to include from this block directory, in import order. CSS is imported before JS so styles register before code runs.",
+                        "description": "Files to include from this block directory, in import order. CSS/SCSS/SASS are imported before JS/TS so styles register before code runs. Supported extensions: .js .ts .tsx .jsx .mjs .cjs .css .scss .sass .html",
                         "type": "array",
                         "items": {
                           "type": "string",
-                          "enum": ["modification.css", "modification.js", "modification.html"]
+                          "pattern": "^[\\w.-]+\\.(js|ts|tsx|jsx|mjs|cjs|css|scss|sass|html)$"
                         },
                         "uniqueItems": true
                       }
@@ -173,5 +186,53 @@
       }
     }
 
+  },
+
+  "$defs": {
+    "pageRule": {
+      "description": "A single URL targeting rule.",
+      "type": "object",
+      "required": ["rule", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "rule": {
+          "description": "Matching strategy to apply against the page URL.",
+          "type": "string",
+          "enum": ["URL_MATCHES", "URL_CONTAINS", "URL_STARTSWITH", "URL_ENDSWITH", "URL_REGEX"]
+        },
+        "value": {
+          "description": "The string or pattern to match against.",
+          "type": "string"
+        },
+        "options": {
+          "description": "Optional flags that modify how the rule is applied.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ignore_query_string": {
+              "description": "Strip the query string from the URL before matching.",
+              "type": "boolean",
+              "default": false
+            },
+            "ignore_fragment": {
+              "description": "Strip the URL fragment (#...) before matching.",
+              "type": "boolean",
+              "default": false
+            },
+            "ignore_protocol": {
+              "description": "Strip the protocol (http:// / https://) before matching.",
+              "type": "boolean",
+              "default": false
+            },
+            "case_sensitive": {
+              "description": "Perform a case-sensitive match (default: false).",
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      }
+    }
   }
+
 }

@@ -127,12 +127,22 @@ window.__ss = {
   _nodes:        [],    // live references to HTML elements injected by ss
   _ts:           null,  // timestamp of the last HTML injection
   _applyHtml(html),     // re-inject variation HTML programmatically
+  _trigger(blocks),     // called by the bundle to execute modification blocks per their trigger type
 };
 ```
 
-## Variation switcher
+## Floating menu and project manager
 
-When more than one variation exists, a floating `<ss-floating-menu>` widget appears on the proxied page. Use it to switch between variations — the page reloads automatically. The widget uses a closed shadow root so host-page styles don't affect it.
+A `<ss-floating-menu>` widget is injected into every proxied page. It shows a variation switcher dropdown (when more than one variation exists) and a gear icon that opens the **project manager modal** (`<ss-modal>`).
+
+The modal has four tabs:
+
+- **General** — active experience and variation, read-only overview
+- **Pages** — preview URL, include/exclude targeting rules (with rule type, value, and option checkboxes)
+- **Content** — variation list with drag-to-reorder, inline rename, delete, radio to switch the active variation, and modification block details
+- **Developer** — raw `config.json` viewer and live log output
+
+Both elements use closed shadow roots so host-page styles cannot affect them.
 
 ## Optional HTML injection
 
@@ -158,7 +168,7 @@ Paste the contents of `dist/<exp>.js` into your A/B testing platform (Optimizely
 
 ## Resource caching
 
-The proxy caches CSS, JS, images, and fonts from the live site to `.cache/`. Subsequent page loads and proxy restarts serve these from disk — making navigation faster during development.
+The proxy caches CSS, JS, images, and fonts from the live site to `.cache/<domain>/` (namespaced by hostname so multi-site projects don't collide). Subsequent page loads and proxy restarts serve these from disk — making navigation faster during development.
 
 ```bash
 ss start --fresh        # clear cache before starting

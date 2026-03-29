@@ -1,6 +1,6 @@
 {
   "name": "start-scripting",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Local dev tool for building A/B tests on live websites",
   "repository": {
     "type": "git",
@@ -16,6 +16,12 @@
   ],
   "scripts": {
     "build": "node bin/ss.mjs build"
+  },
+  "peerDependencies": {
+    "sass": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "sass": { "optional": true }
   },
   "dependencies": {
     "commander": "^12.1.0",

@@ -60,7 +60,11 @@ experiences/<exp-slug>/
   "active": { "experience": "slug", "variation": "slug" },
   "experiences": [{
     "name": "Display Name", "slug": "display-name",
-    "pages": { "editor": "https://...", "include": [], "exclude": [] },
+    "pages": {
+      "editor": "https://...",
+      "include": [{ "rule": "URL_MATCHES", "value": "https://example.com", "options": { "ignore_query_string": true } }],
+      "exclude": []
+    },
     "variations": [{
       "name": "Control", "slug": "control"
     }, {
@@ -69,6 +73,10 @@ experiences/<exp-slug>/
         "name": "Hero Copy", "slug": "hero-copy",
         "trigger": "DOM_READY",
         "resources": ["modification.css", "modification.js", "modification.html"]
+      }, {
+        "name": "Sticky Bar", "slug": "sticky-bar",
+        "trigger": "ELEMENT_LOADED", "selector": "#header", "once": true,
+        "resources": ["modification.css", "modification.js"]
       }]
     }],
     "audiences": []
@@ -76,6 +84,8 @@ experiences/<exp-slug>/
   "settings": { "cache_ttl": 3600, "timeout_ms": 30000, "spa": false, "ssr": false }
 }
 ```
+
+Page rule types: `URL_MATCHES`, `URL_CONTAINS`, `URL_STARTSWITH`, `URL_ENDSWITH`, `URL_REGEX`. Options: `ignore_query_string`, `ignore_fragment`, `ignore_protocol`, `case_sensitive`.
 
 ## How injection works
 
@@ -96,28 +106,85 @@ Variation HTML is NOT wrapped in a container element. `_applyHtml()`:
 3. Stamps each top-level element with `data-ss-added="<timestamp>"`
 4. Appends directly to `document.body`; stores live references in `window.__ss._nodes`
 
-### CSS handling
+### Supported resource file extensions
 
-Modification blocks import CSS (`import '../../experiences/.../modification.css'`) which is transformed by `cssInjectorPlugin` (in `src/builder.mjs`) into JS that injects a `<style type="text/css" id="__ss_styles" data-ss-added="styles">` tag — final output is a single self-contained `.js` file.
+Scripts: `.js` `.ts` `.tsx` `.jsx` `.mjs` `.cjs` — esbuild handles TS/TSX/JSX natively. `.tsx`/`.jsx` files are treated as React components (auto-mounted, see below).
+
+Styles: `.css` `.scss` `.sass` — SCSS/SASS require `sass` as an optional peer dep (`npm install sass` in the project).
+
+Markup: `.html` — injected as DOM fragments before `</body>`.
+
+Default scaffold filenames (`modification.js`, `modification.css`, `modification.html`) are just defaults. Any supported filename works as long as it is listed in the block's `resources` array.
+
+### CSS / style handling
+
+Style files (`.css`/`.scss`/`.sass`) are imported bare in the entry file and transformed by `cssInjectorPlugin` (in `src/builder.mjs`) into JS that injects a `<style type="text/css" id="__ss_styles" data-ss-added="styles">` tag. SCSS/SASS are compiled via `sass.compile()` before injection. Final output is a single self-contained `.js` bundle.
 
 ### esbuild entry files
 
-`dist/entry/<exp-slug>.js` is a synthetic file written by `writeCacheEntry()` (in `src/scaffold.mjs`) that imports CSS then JS from all modification blocks in the order defined in `config.json`. Paths use `../../` relative to `dist/entry/`. esbuild reads this file and bundles everything into `dist/bundle.js`.
+`dist/entry/<exp-slug>.js` is a synthetic file written by `writeCacheEntry()` (in `src/scaffold.mjs`). It contains:
+1. Bare CSS/style imports (one per style resource, in `resources` order)
+2. A `window.__ss._trigger([...])` call with one descriptor per JS block
+
+Each descriptor: `{ slug, trigger, run, [selector, once, dependency] }`. The `run` field is either `() => import(...)` for plain JS/TS, or an inline function that resolves React and mounts the default export for `.tsx`/`.jsx` files.
+
+### Trigger runtime
+
+`window.__ss._trigger(blocks)` is defined in the `config` script block and called by the compiled bundle:
+- `IMMEDIATE` — `run()` called immediately
+- `DOM_READY` — waits for `DOMContentLoaded` or fires immediately if DOM is already ready
+- `ELEMENT_LOADED` — MutationObserver watches for `block.selector`; fires once (default) or on every match. The matched element is passed to `run(el)`.
+- `AFTER_CODE_BLOCK` — queued until the named `dependency` block's `run()` promise resolves
+
+### React component mounting (`.tsx` / `.jsx`)
+
+Entry files for React blocks include static `import` statements for `react` and `react-dom/client` so esbuild bundles them. At runtime `window.React || bundledReact` is used — if the host page already exposes React globally, the bundled copy is unused. Mount target: for `ELEMENT_LOADED` the matched element is used as root; for all other triggers a new `<div>` is appended to `document.body`.
 
 ### Live reload
 
-The WebSocket server at `/__ss__/ws` broadcasts three message types:
+The WebSocket server at `/__ss__/ws` is bidirectional:
+
+**Server → client broadcasts:**
 - `{ type: "reload" }` — triggers `location.reload()` (JS changes, variation switches)
 - `{ type: "css-update", css }` — updates `#__ss_styles` textContent in place
 - `{ type: "html-update", html }` — calls `window.__ss._applyHtml(html)`
 
-### Variation switcher
+**Client → server commands** (from `<ss-modal>`):
+- Each message: `{ action, id, ...payload }`. Server replies `{ type: "cmd-result", id, ok, [error] }`.
+- Actions: `switch-variation`, `rename-variation`, `reorder-variations`, `create-variation`, `delete-variation`, `rename-modification`, `reorder-modifications`, `delete-modification`, `set-page-rules`
+- Handled by `handleCommand()` in `proxy.mjs` — mutates `config.json` and broadcasts `reload` where needed.
 
-`<ss-floating-menu>` is a custom element with a **closed** shadow root, so host-page styles cannot affect it. It fetches `/__ss__/variations` for the variation list and posts to `/__ss__/switch?v=<slug>`. The server broadcasts `reload` after a switch (even for Control where no source files change).
+### Floating menu and project manager modal
+
+`<ss-floating-menu>` (z-index 2147483645) — closed shadow root, shows two SVG logo icons + variation `<select>` (when ≥2 variations exist) + gear button. Gear button dispatches `ss-open-modal` custom event that bubbles through the real DOM.
+
+`<ss-modal>` (z-index 2147483647, always above the menu) — separate custom element, closed shadow root. Listens for `ss-open-modal` on `document`. Four tabs:
+- **General** — read-only: active experience/variation name, slug, modification count
+- **Pages** — editable preview URL; include/exclude page rules (rule type dropdown + value + option checkboxes); drag-to-reorder
+- **Content** — variation cards with radio to switch active, drag-to-reorder (except Control), inline rename, delete; modification rows with drag-to-reorder, inline rename, delete; "+ New variation" button
+- **Developer** — raw `config.json` viewer (`GET /__ss__/raw-config`); scrollable log list (`GET /__ss__/logs`)
+
+### Log buffer
+
+Module-level console interception in `proxy.mjs` captures all `log`/`warn`/`error` output into a 500-entry circular buffer (`_logs`). Exposed via `GET /__ss__/logs`.
+
+### API endpoints
+
+| Route | Description |
+|---|---|
+| `GET /__ss__/bundle.js` | Compiled bundle |
+| `GET /__ss__/variations` | `{ active, all }` for the variation switcher |
+| `GET /__ss__/config` | Mirrors `window.__ss` session state |
+| `GET /__ss__/project` | Full config tree + `editorUrl` for the modal |
+| `POST /__ss__/settings` | Update `pages.editor` URL |
+| `GET /__ss__/switch?v=<slug>` | Switch active variation |
+| `GET /__ss__/raw-config` | Raw `config.json` for the Developer tab |
+| `GET /__ss__/logs` | In-memory log buffer |
+| `WS /__ss__/ws` | Live-reload broadcasts + command channel |
 
 ### Resource caching
 
-`.cache/` stores proxied static assets (CSS, JS, images, fonts). The cache middleware runs before the proxy middleware — on a hit it serves from disk. CSS is URL-rewritten on serve so cached files remain valid after port changes. `writeToCache()` is miss-only (never overwrites).
+`.cache/<domain>/` stores proxied static assets (CSS, JS, images, fonts) namespaced by the target hostname (e.g. `.cache/example.com/styles/main.css`). This supports multi-site projects without cross-domain cache collisions. The cache middleware runs before the proxy middleware — on a hit it serves from disk. CSS is URL-rewritten on serve so cached files remain valid after port changes. `writeToCache()` is miss-only (never overwrites).
 
 ### Filesystem sync
 

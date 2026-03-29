@@ -3,7 +3,14 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { join, extname } from 'path';
+
+// File extensions treated as CSS-type (injected as <style> tags via esbuild plugins)
+const CSS_EXTS = new Set(['.css', '.scss', '.sass']);
+// File extensions treated as JS-type (bundled and executed via trigger runtime)
+const JS_EXTS  = new Set(['.js', '.ts', '.tsx', '.jsx', '.mjs', '.cjs']);
+// JSX/TSX files are React components — get a React-aware mount wrapper
+const JSX_EXTS = new Set(['.tsx', '.jsx']);
 
 /**
  * Convert a display name to a filesystem-safe slug.
@@ -33,7 +40,7 @@ export function writeCacheEntry(expSlug, varSlug) {
   mkdirSync(cacheDir, { recursive: true });
 
   const configPath = join(process.cwd(), 'config.json');
-  let imports = '';
+  let content = '';
 
   try {
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
@@ -41,25 +48,88 @@ export function writeCacheEntry(expSlug, varSlug) {
     const variation = exp?.variations?.find((v) => v.slug === varSlug);
 
     if (variation?.modifications?.length) {
-      const lines = [];
+      const cssLines = [];
+      const blockDefs = [];
+
       for (const mod of variation.modifications) {
-        if (!mod?.slug) continue; // skip malformed entries without a slug
-        const blockPath = `experiences/${expSlug}/${varSlug}/${mod.slug}`;
-        // CSS first so styles are registered before the JS runs
+        if (!mod?.slug) continue;
         // Note: dist/entry/ is two levels deep, so ../../ returns to project root
-        if (mod.resources?.includes('modification.css')) {
-          lines.push(`import '../../${blockPath}/modification.css';`);
+        const blockPath = `../../experiences/${expSlug}/${varSlug}/${mod.slug}`;
+
+        // CSS-type files (css/scss/sass) are imported bare — they run through
+        // the style injector plugin and inject a <style> tag immediately.
+        for (const file of (mod.resources || [])) {
+          if (CSS_EXTS.has(extname(file).toLowerCase())) {
+            cssLines.push(`import '${blockPath}/${file}';`);
+          }
         }
-        if (mod.resources?.includes('modification.js')) {
-          lines.push(`import '../../${blockPath}/modification.js';`);
+
+        // JS-type files — wrapped in a trigger descriptor so the runtime decides
+        // when to execute them. JSX/TSX files get a React-aware mount wrapper;
+        // plain JS/TS files use a dynamic import() which esbuild bundles normally.
+        const jsFile = (mod.resources || []).find(f => JS_EXTS.has(extname(f).toLowerCase()));
+        if (jsFile) {
+          const trigger = mod.trigger || 'DOM_READY';
+          const isReact = JSX_EXTS.has(extname(jsFile).toLowerCase());
+          const parts = [
+            `slug: ${JSON.stringify(mod.slug)}`,
+            `trigger: ${JSON.stringify(trigger)}`,
+          ];
+          if (trigger === 'ELEMENT_LOADED') {
+            parts.push(`selector: ${JSON.stringify(mod.selector || '')}`);
+            parts.push(`once: ${mod.once !== false}`);
+          }
+          if (trigger === 'AFTER_CODE_BLOCK') {
+            parts.push(`dependency: ${JSON.stringify(mod.dependency || '')}`);
+          }
+
+          if (isReact) {
+            // Unique per-block variable names (slugs may contain hyphens, use index)
+            const idx = blockDefs.length;
+            const reactVar = `__ss_react_${idx}`;
+            const rdVar    = `__ss_rd_${idx}`;
+            const compVar  = `__ss_comp_${idx}`;
+
+            // Static imports at the top of the entry file so esbuild bundles them.
+            // At runtime we prefer the copy already on the page to avoid two Reacts.
+            cssLines.unshift(
+              `import * as ${reactVar} from 'react';`,
+              `import * as ${rdVar}    from 'react-dom/client';`,
+              `import ${compVar}       from '${blockPath}/${jsFile}';`,
+            );
+
+            // run(el): el is the matched element for ELEMENT_LOADED, else undefined.
+            // For ELEMENT_LOADED we mount as the last child of the matched element;
+            // for all other triggers we append a new <div> to document.body.
+            parts.push(
+              `run: function(el) {
+    var R  = window.React    || ${reactVar};
+    var RD = window.ReactDOM || ${rdVar};
+    var C  = ${compVar}.default || ${compVar};
+    var mount = el ? el : document.createElement('div');
+    if (!el) document.body.appendChild(mount);
+    RD.createRoot(mount).render(R.createElement(C, null));
+    return Promise.resolve();
+  }`,
+            );
+          } else {
+            parts.push(`run: function() { return import('${blockPath}/${jsFile}'); }`);
+          }
+
+          blockDefs.push(`  { ${parts.join(', ')} }`);
         }
       }
-      imports = lines.join('\n');
+
+      const lines = [...cssLines];
+      if (blockDefs.length) {
+        lines.push(`window.__ss._trigger([\n${blockDefs.join(',\n')}\n]);`);
+      }
+      content = lines.join('\n');
     }
   } catch {}
 
-  const content = imports || `// ${expSlug}/${varSlug} — no modifications defined`;
-  writeFileSync(join(cacheDir, `${expSlug}.js`), content + '\n');
+  const finalContent = content || `// ${expSlug}/${varSlug} — no modifications defined`;
+  writeFileSync(join(cacheDir, `${expSlug}.js`), finalContent + '\n');
 }
 
 /**

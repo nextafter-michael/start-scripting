@@ -15,9 +15,15 @@
 import * as esbuild from 'esbuild';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'fs';
 import { join, extname } from 'path';
+import { createRequire } from 'module';
+
+const _require = createRequire(import.meta.url);
 
 // Valid resource extensions inside a modification block directory
-const RESOURCE_EXTS = new Set(['.js', '.css', '.html']);
+const RESOURCE_EXTS = new Set(['.js', '.ts', '.tsx', '.jsx', '.mjs', '.cjs', '.css', '.scss', '.sass', '.html']);
+
+// Extension sort order for conventional resource ordering: styles → scripts → html
+const EXT_ORDER = ['.css', '.scss', '.sass', '.js', '.ts', '.tsx', '.jsx', '.mjs', '.cjs', '.html'];
 
 /**
  * Sync config.json from what actually exists on disk inside experiences/.
@@ -113,11 +119,12 @@ function syncExperiencesDir(expSlug) {
         if (!fst.isFile()) continue;
 
         if (!block.resources.includes(fileName)) {
-          // Maintain conventional order: css → js → html
+          // Maintain conventional order: styles → scripts → html
           block.resources.push(fileName);
           block.resources.sort((a, b) => {
-            const order = ['.css', '.js', '.html'];
-            return order.indexOf(extname(a)) - order.indexOf(extname(b));
+            const ai = EXT_ORDER.indexOf(extname(a).toLowerCase());
+            const bi = EXT_ORDER.indexOf(extname(b).toLowerCase());
+            return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
           });
           console.log(`  + Detected new resource: ${varName}/${blockName}/${fileName}`);
           dirty = true;
@@ -132,20 +139,34 @@ function syncExperiencesDir(expSlug) {
 }
 
 /**
- * esbuild plugin: CSS injector
+ * esbuild plugin: style injector
  *
- * Converts any .css import into JavaScript that creates a <style> tag,
- * so the final output is a single self-contained .js file.
+ * Converts any .css / .scss / .sass import into JavaScript that creates a
+ * <style> tag, so the final output is a single self-contained .js file.
  * The stable id="__ss_styles" lets the WebSocket handler hot-swap CSS
  * without a full page reload.
+ *
+ * SCSS/SASS are compiled via the `sass` package if it is installed. If it
+ * isn't, esbuild will throw a clear "Cannot find package 'sass'" error at
+ * build time rather than silently falling back.
  */
 function cssInjectorPlugin() {
   return {
     name: 'css-injector',
     setup(build) {
-      build.onLoad({ filter: /\.css$/ }, async (args) => {
+      build.onLoad({ filter: /\.(css|scss|sass)$/ }, async (args) => {
         const { readFile } = await import('fs/promises');
-        const css = await readFile(args.path, 'utf8');
+        const ext = args.path.split('.').pop().toLowerCase();
+
+        let css;
+        if (ext === 'scss' || ext === 'sass') {
+          const sass = await import('sass');
+          const result = sass.compile(args.path, { style: 'expanded' });
+          css = result.css;
+        } else {
+          css = await readFile(args.path, 'utf8');
+        }
+
         return {
           contents: `
 const __ss_style = document.createElement('style');
@@ -174,13 +195,26 @@ function buildOptions(entryPoint, projectDir, outfile) {
     bundle: true,
     format: 'iife',
     sourcemap: true,
+    // esbuild handles ts/tsx/jsx natively; loaders map extensions to their transformer
+    loader: {
+      '.ts':  'ts',
+      '.tsx': 'tsx',
+      '.jsx': 'jsx',
+      '.mjs': 'js',
+      '.cjs': 'js',
+    },
     plugins: [cssInjectorPlugin()],
   };
 }
 
+const CSS_EXTS  = new Set(['.css', '.scss', '.sass']);
+const HTML_EXTS = new Set(['.html']);
+
 /**
- * Read CSS from all modification blocks in config order for the given variation.
- * Sent to the browser on css-update so the style tag can be swapped without reload.
+ * Read and concatenate compiled CSS from all modification blocks in config order.
+ * .css files are read as-is. .scss/.sass files are compiled via the `sass`
+ * package so the hot-swap message always sends valid CSS the browser can apply.
+ * Falls back to empty string per file on any read/compile error.
  */
 function readCssFiles(expSlug, varSlug) {
   try {
@@ -190,10 +224,26 @@ function readCssFiles(expSlug, varSlug) {
     const variation = exp?.variations?.find((v) => v.slug === varSlug);
     if (!variation?.modifications?.length) return '';
 
+    // sass is an optional peer dep — loaded on first SASS file encountered
+    let sassCompiler = null;
+    function getSass() {
+      if (!sassCompiler) sassCompiler = _require('sass');
+      return sassCompiler;
+    }
+
     return variation.modifications
-      .map((mod) => {
-        const filePath = join(process.cwd(), 'experiences', expSlug, varSlug, mod.slug, 'modification.css');
-        try { return readFileSync(filePath, 'utf8'); } catch { return ''; }
+      .flatMap((mod) => {
+        const blockDir = join(process.cwd(), 'experiences', expSlug, varSlug, mod.slug);
+        return (mod.resources || [])
+          .filter(f => CSS_EXTS.has(extname(f).toLowerCase()))
+          .map(f => {
+            const filePath = join(blockDir, f);
+            const ext = extname(f).toLowerCase();
+            try {
+              if (ext === '.scss' || ext === '.sass') return getSass().compile(filePath).css;
+              return readFileSync(filePath, 'utf8');
+            } catch { return ''; }
+          });
       })
       .join('\n');
   } catch {
@@ -202,8 +252,7 @@ function readCssFiles(expSlug, varSlug) {
 }
 
 /**
- * Read HTML from all modification blocks in config order for the given variation.
- * Sent to the browser on html-update to replace #__ss_html innerHTML.
+ * Read and concatenate HTML from all modification blocks in config order.
  */
 function readVariationHtml(expSlug, varSlug) {
   try {
@@ -213,18 +262,21 @@ function readVariationHtml(expSlug, varSlug) {
     const variation = exp?.variations?.find((v) => v.slug === varSlug);
     if (!variation?.modifications?.length) return '';
 
-    const parts = variation.modifications
-      .map((mod) => {
-        const filePath = join(process.cwd(), 'experiences', expSlug, varSlug, mod.slug, 'modification.html');
-        try {
-          const raw = readFileSync(filePath, 'utf8');
-          const stripped = raw.replace(/<!--[\s\S]*?-->/g, '').trim();
-          return stripped ? raw.trim() : '';
-        } catch { return ''; }
+    return variation.modifications
+      .flatMap((mod) => {
+        const blockDir = join(process.cwd(), 'experiences', expSlug, varSlug, mod.slug);
+        return (mod.resources || [])
+          .filter(f => HTML_EXTS.has(extname(f).toLowerCase()))
+          .map(f => {
+            try {
+              const raw = readFileSync(join(blockDir, f), 'utf8');
+              const stripped = raw.replace(/<!--[\s\S]*?-->/g, '').trim();
+              return stripped ? raw.trim() : '';
+            } catch { return ''; }
+          });
       })
-      .filter(Boolean);
-
-    return parts.join('\n');
+      .filter(Boolean)
+      .join('\n');
   } catch {
     return '';
   }
@@ -325,9 +377,9 @@ export async function startBuilder(expSlug, varSlug, broadcast) {
 
     if (changedFiles.length === 0) return;
 
-    const hasJs   = changedFiles.some((f) => f.endsWith('.js'));
-    const hasCss  = changedFiles.some((f) => f.endsWith('.css'));
-    const hasHtml = changedFiles.some((f) => f.endsWith('.html'));
+    const hasJs   = changedFiles.some((f) => ['.js','.ts','.tsx','.jsx','.mjs','.cjs'].includes(extname(f).toLowerCase()));
+    const hasCss  = changedFiles.some((f) => ['.css','.scss','.sass'].includes(extname(f).toLowerCase()));
+    const hasHtml = changedFiles.some((f) => extname(f).toLowerCase() === '.html');
 
     writeCacheEntry(expSlug, activeVariation);
     lastSnapshot = current;
