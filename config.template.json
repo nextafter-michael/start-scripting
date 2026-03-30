@@ -127,6 +127,12 @@
                         "description": "Slug of another block in the same variation that must run first (AFTER_CODE_BLOCK only).",
                         "type": "string"
                       },
+                      "hide_elements_until_code_runs": {
+                        "description": "CSS selectors for elements to hide (visibility:hidden) immediately when ss initialises, before this block's code runs. The hiding style tag is removed once the block's run() promise settles, preventing layout flash. Useful for hero sections or elements the test will replace.",
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": []
+                      },
                       "resources": {
                         "description": "Files to include from this block directory, in import order. CSS/SCSS/SASS are imported before JS/TS so styles register before code runs. Supported extensions: .js .ts .tsx .jsx .mjs .cjs .css .scss .sass .html",
                         "type": "array",
@@ -174,12 +180,22 @@
           "default": 30000
         },
         "spa": {
-          "description": "Enable single-page-app mode (re-applies modifications on client-side route changes). Reserved for future use.",
+          "description": "Re-apply modifications on every client-side route change (pushState / replaceState / popstate). Removes ss-injected nodes then re-injects HTML and re-runs the bundle after each navigation.",
           "type": "boolean",
           "default": false
         },
         "ssr": {
           "description": "Hint that the target site uses server-side rendering (affects HTML injection strategy). Reserved for future use.",
+          "type": "boolean",
+          "default": false
+        },
+        "inject_jquery": {
+          "description": "Load jQuery 3 from CDN into every proxied page if window.jQuery is not already present.",
+          "type": "boolean",
+          "default": false
+        },
+        "inject_fontawesome": {
+          "description": "Load Font Awesome 6 Free (CSS) from CDN into every proxied page if it is not already present.",
           "type": "boolean",
           "default": false
         }

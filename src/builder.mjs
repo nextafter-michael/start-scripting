@@ -350,6 +350,7 @@ export async function startBuilder(expSlug, varSlug, broadcast) {
   let lastSnapshot = getSnapshot(variationDir);
 
   let rebuilding = false;
+  let variationSwitched = false; // force rebuild even when both snapshots are empty (e.g. switching to/from Control)
   setInterval(async () => {
     if (rebuilding) return;
 
@@ -363,6 +364,7 @@ export async function startBuilder(expSlug, varSlug, broadcast) {
       activeVariation = currentVariation;
       variationDir = join(projectDir, 'experiences', expSlug, activeVariation);
       lastSnapshot = {};
+      variationSwitched = true;
     }
 
     const current = getSnapshot(variationDir);
@@ -375,7 +377,11 @@ export async function startBuilder(expSlug, varSlug, broadcast) {
     const modified = currentKeys.filter((f) => f in lastSnapshot && lastSnapshot[f] !== current[f]);
     const changedFiles = [...added, ...removed, ...modified];
 
-    if (changedFiles.length === 0) return;
+    // Skip if nothing changed, unless a variation switch just happened
+    // (switching to Control has no files — both snapshots are empty — but we
+    //  must still rebuild so the old variation's bundle is replaced).
+    if (changedFiles.length === 0 && !variationSwitched) return;
+    variationSwitched = false;
 
     const hasJs   = changedFiles.some((f) => ['.js','.ts','.tsx','.jsx','.mjs','.cjs'].includes(extname(f).toLowerCase()));
     const hasCss  = changedFiles.some((f) => ['.css','.scss','.sass'].includes(extname(f).toLowerCase()));

@@ -53,6 +53,7 @@ export function writeCacheEntry(expSlug, varSlug) {
 
       for (const mod of variation.modifications) {
         if (!mod?.slug) continue;
+        if (mod.enabled === false) continue; // skip disabled blocks
         // Note: dist/entry/ is two levels deep, so ../../ returns to project root
         const blockPath = `../../experiences/${expSlug}/${varSlug}/${mod.slug}`;
 

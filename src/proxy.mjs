@@ -26,6 +26,7 @@ import {
   mkdirSync,
   existsSync,
   rmSync,
+  statSync,
 } from "fs";
 import { join, dirname, extname } from "path";
 
@@ -63,6 +64,7 @@ function loadVariationHtml() {
   const parts = [];
   for (const mod of variation.modifications) {
     if (!mod?.slug) continue; // guard against malformed config entries
+    if (mod.enabled === false) continue; // skip disabled blocks
     const blockDir = join(process.cwd(), "experiences", expSlug, varSlug, mod.slug);
     for (const file of (mod.resources || [])) {
       if (!HTML_EXTS.has(extname(file).toLowerCase())) continue;
@@ -88,7 +90,9 @@ function listVariations() {
   const exp = config.experiences?.find((e) => e.slug === expSlug);
   if (!exp) return { active: config.active?.variation, all: [] };
 
-  const all = (exp.variations || []).map((v) => ({ name: v.name, slug: v.slug }));
+  const all = (exp.variations || [])
+    .filter((v) => v.enabled !== false)
+    .map((v) => ({ name: v.name, slug: v.slug }));
   return { active: config.active?.variation, all };
 }
 
@@ -106,16 +110,42 @@ function buildWindowSsBlock() {
   const exp = config.experiences?.find((e) => e.slug === expSlug);
   const variation = exp?.variations?.find((v) => v.slug === varSlug);
 
+  const settings = config.settings || {};
+  // targetOrigin is embedded so the client-side UI can show the real site URL
+  // rather than the localhost proxy URL (location.href on the proxied page is
+  // http://localhost:PORT/... but the code will eventually run on targetOrigin).
+  const targetOriginForClient = (() => {
+    try {
+      const exp2 = config.experiences?.find((e) => e.slug === expSlug);
+      const editor = exp2?.pages?.editor;
+      if (editor) return new URL(editor).origin;
+    } catch {}
+    return null;
+  })();
+
   const data = {
     experience: exp ? { name: exp.name, slug: exp.slug } : null,
     variation:  variation ? { name: variation.name, slug: variation.slug } : null,
     modifications: (variation?.modifications || [])
-      .filter((m) => m?.slug)
-      .map((m) => ({ name: m.name, slug: m.slug, trigger: m.trigger })),
+      .filter((m) => m?.slug && m.enabled !== false)
+      .map((m) => ({
+        name: m.name, slug: m.slug, trigger: m.trigger,
+        hide_elements_until_code_runs: m.hide_elements_until_code_runs || [],
+      })),
+    settings: {
+      spa:          !!settings.spa,
+      inject_jquery: !!settings.inject_jquery,
+      inject_fontawesome: !!settings.inject_fontawesome,
+    },
+    _targetOrigin: targetOriginForClient,
   };
 
   // JSON carries the data; the non-serialisable parts (_applyHtml etc.) are
   // appended as plain JS so they're available before the HTML-init script runs.
+  const spaEnabled     = !!settings.spa;
+  const jqueryEnabled  = !!settings.inject_jquery;
+  const faEnabled      = !!settings.inject_fontawesome;
+
   return `<script type="text/javascript" data-ss-added="config">
 window.__ss = ${JSON.stringify(data)};
 window.__ss._nodes = [];
@@ -140,18 +170,42 @@ window.__ss._applyHtml = function(html) {
   window.__ss._ts = ts;
 };
 
+// Remove all ss-injected nodes and style tags added by _trigger (for SPA re-apply).
+window.__ss._removeAll = function() {
+  (window.__ss._nodes || []).forEach(function(n) { if (n.parentNode) n.parentNode.removeChild(n); });
+  window.__ss._nodes = [];
+  document.querySelectorAll('[data-ss-hide]').forEach(function(el) { el.parentNode && el.parentNode.removeChild(el); });
+};
+
 // Trigger runtime — called by the compiled bundle with a list of block descriptors.
-// Each descriptor: { slug, trigger, run, [selector], [once], [dependency] }
+// Each descriptor: { slug, trigger, run, [selector], [once], [dependency], [hide_elements_until_code_runs] }
 //   IMMEDIATE       — run() called right away
 //   DOM_READY       — run() after DOMContentLoaded (or immediately if DOM is ready)
 //   ELEMENT_LOADED  — run() each time a node matching selector appears in the DOM;
 //                     if once:true (default) the observer is disconnected after first fire
 //   AFTER_CODE_BLOCK — run() after the named dependency block's run() promise resolves
+//
+// hide_elements_until_code_runs: array of CSS selectors. A <style data-ss-hide="slug">
+// that sets visibility:hidden on those selectors is injected immediately, then removed
+// once the block's run() promise settles.
 window.__ss._done    = {};  // slug → true once run() promise resolves
 window.__ss._waiting = {};  // dependency slug → [callbacks]
 
 window.__ss._trigger = function(blocks) {
-  function finish(slug) {
+  // Inject flash-hide style for a block, returns a cleanup function
+  function injectHide(block) {
+    var sels = block.hide_elements_until_code_runs;
+    if (!sels || !sels.length) return function() {};
+    var style = document.createElement('style');
+    style.setAttribute('data-ss-hide', block.slug);
+    style.setAttribute('data-ss-added', 'hide-' + block.slug);
+    style.textContent = sels.join(',') + '{visibility:hidden!important}';
+    (document.head || document.documentElement).appendChild(style);
+    return function() { if (style.parentNode) style.parentNode.removeChild(style); };
+  }
+
+  function finish(slug, removeHide) {
+    if (removeHide) removeHide();
     window.__ss._done[slug] = true;
     var cbs = window.__ss._waiting[slug] || [];
     delete window.__ss._waiting[slug];
@@ -159,9 +213,11 @@ window.__ss._trigger = function(blocks) {
   }
 
   // el is the matched DOM element for ELEMENT_LOADED blocks; undefined otherwise.
-  // React blocks use it as the mount parent; plain blocks ignore it.
   function exec(block, el) {
-    block.run(el).then(function() { finish(block.slug); }).catch(function() { finish(block.slug); });
+    var removeHide = injectHide(block);
+    block.run(el)
+      .then(function()  { finish(block.slug, removeHide); })
+      .catch(function() { finish(block.slug, removeHide); });
   }
 
   blocks.forEach(function(block) {
@@ -185,9 +241,8 @@ window.__ss._trigger = function(blocks) {
         if (!el) return;
         if (once && fired) return;
         fired = true;
-        exec(block, el);  // pass matched element so React blocks can mount inside it
+        exec(block, el);
       }
-      // Check nodes already in the DOM
       tryMatch(document.body || document.documentElement);
       if (once && fired) return;
       var obs = new MutationObserver(function(mutations) {
@@ -212,6 +267,60 @@ window.__ss._trigger = function(blocks) {
     }
   });
 };
+${spaEnabled ? `
+// SPA mode — re-apply modifications on client-side route changes.
+// Watches history.pushState / replaceState and the popstate event.
+// On navigation: removes ss-injected nodes, waits for DOM_READY, then
+// re-fetches the HTML snippet from the server and re-applies everything.
+(function() {
+  function ssReapply() {
+    window.__ss._removeAll();
+    window.__ss._done    = {};
+    window.__ss._waiting = {};
+    var req = new XMLHttpRequest();
+    req.open('GET', '/__ss__/html-snippet', true);
+    req.onload = function() {
+      if (req.status === 200) {
+        try {
+          var data = JSON.parse(req.responseText);
+          if (data.html) window.__ss._applyHtml(data.html);
+        } catch(_) {}
+      }
+    };
+    req.send();
+    // Re-trigger the bundle by dispatching a synthetic DOMContentLoaded-like event
+    // that the ss runtime can react to. We reload the bundle script tag instead.
+    var old = document.querySelector('script[data-ss-added="bundle"]');
+    if (old) {
+      var s = document.createElement('script');
+      s.src = old.src + (old.src.includes('?') ? '&' : '?') + '_t=' + Date.now();
+      s.setAttribute('data-ss-added', 'bundle');
+      old.parentNode.replaceChild(s, old);
+    }
+  }
+  var _push = history.pushState.bind(history);
+  var _replace = history.replaceState.bind(history);
+  history.pushState = function() { _push.apply(history, arguments); ssReapply(); };
+  history.replaceState = function() { _replace.apply(history, arguments); ssReapply(); };
+  window.addEventListener('popstate', ssReapply);
+})();` : ''}
+${jqueryEnabled ? `
+// jQuery injection — load only if not already present on the page.
+if (!window.jQuery) {
+  var jqs = document.createElement('script');
+  jqs.src = 'https://cdn.jsdelivr.net/npm/jquery@3/dist/jquery.min.js';
+  jqs.setAttribute('data-ss-added', 'jquery');
+  document.head.appendChild(jqs);
+}` : ''}
+${faEnabled ? `
+// Font Awesome injection — load only if not already present on the page.
+if (!document.querySelector('link[href*="font-awesome"],link[href*="fontawesome"]')) {
+  var fal = document.createElement('link');
+  fal.rel  = 'stylesheet';
+  fal.href = 'https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6/css/all.min.css';
+  fal.setAttribute('data-ss-added', 'fontawesome');
+  document.head.appendChild(fal);
+}` : ''}
 </script>`;
 }
 
@@ -333,13 +442,17 @@ function buildInjectSnippet(ssOrigin) {
   })();
 
   // ── <ss-floating-menu> web component ──────────────────────────────────────
-  // Slim bar: "ss" label + variation switcher + gear icon.
-  // The gear button dispatches a custom "ss-open-modal" event that bubbles up
-  // through the real DOM so <ss-modal> (a sibling on document.body) can hear it.
+  // Draggable bar: drag handle + "ss" logo + variation switcher + gear icon.
+  // Visibility: fades out when the page loses focus or the mouse leaves the
+  // document body; fades back in on mouse re-entry or focus.
+  // Position is persisted to sessionStorage so it survives soft reloads.
   class SsFloatingMenu extends HTMLElement {
     constructor() {
       super();
       this._root = this.attachShadow({ mode: 'closed' });
+      this._dragging = false;
+      this._dragOffX  = 0;
+      this._dragOffY  = 0;
     }
     async connectedCallback() {
       const data = await fetch('${ssOrigin}/__ss__/variations').then(r => r.json());
@@ -351,34 +464,45 @@ function buildInjectSnippet(ssOrigin) {
             align-items: center;
             gap: 8px;
             position: fixed;
-            top: 50%;
-            left: 4px;
             z-index: 2147483645;
-            transform: translateY(-50%);
             font: 13px/1.4 -apple-system, system-ui, sans-serif;
             background: #1a1a2e;
             color: #eee;
-            border-radius: 8px;
+            border-radius: 8px; /* default; overridden by applyPos() when docked */
             padding: 6px 10px;
             box-shadow: 0 2px 12px rgba(0,0,0,.4);
             user-select: none;
+            opacity: 0;
+            transition: opacity .25s ease, border-radius .15s ease;
           }
+          :host(.ss-visible)   { opacity: 0.70; }
+          :host(.ss-hovered)   { opacity: 1; }
+          .drag-handle {
+            display: flex;
+            align-items: center;
+            color: #444;
+            cursor: grab;
+            font-size: 14px;
+            padding: 0 2px 0 0;
+            line-height: 1;
+            flex-shrink: 0;
+          }
+          .drag-handle:active { cursor: grabbing; }
           .logo {
             display: flex;
             align-items: center;
-            gap: 1px;
             opacity: 0.7;
             transform: skewX(-20deg) scale(1.15);
             gap: 0;
             color: coral;
-            svg {
-              width: 8px;
-              height: 18px;
-              path {
-                stroke: currentColor;
-                stroke-width: 0.7;
-              }
-            }
+          }
+          .logo svg {
+            width: 8px;
+            height: 18px;
+          }
+          .logo svg path, .logo svg use {
+            stroke: currentColor;
+            stroke-width: 0.7;
           }
           select {
             background: #2d2d44;
@@ -405,6 +529,7 @@ function buildInjectSnippet(ssOrigin) {
           }
           .settings-btn:hover { color: #fff; }
         </style>
+        <span class="drag-handle" title="Drag to move">⠿</span>
         <span class="logo" aria-label="ss">
           <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox=".5 .5 5 11"><path id="ss-logo-a" fill="none" stroke="#fff" stroke-width=".4" d="M3 9V7L1 5V3L3 1 5 3V5L4 6"/><use xlink:href="#ss-logo-a" transform="rotate(180 3 6)"/></svg>
           <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox=".5 .5 5 11"><path id="ss-logo-b" fill="none" stroke="#fff" stroke-width=".4" d="M3 9V7L1 5V3L3 1 5 3V5L4 6"/><use xlink:href="#ss-logo-b" transform="rotate(180 3 6)"/></svg>
@@ -424,6 +549,112 @@ function buildInjectSnippet(ssOrigin) {
         </button>
       \`;
 
+      // ── Snap + styling helpers ────────────────────────────────────────────
+      // Returns { sbX, sbY } — the pixel width of vertical and horizontal
+      // scrollbars respectively (0 when no scrollbar is visible).
+      const scrollbarSizes = () => ({
+        sbX: window.innerWidth  - document.documentElement.clientWidth,
+        sbY: window.innerHeight - document.documentElement.clientHeight,
+      });
+
+      // Apply position + border-radius that reflects which edges are docked.
+      // border-radius order: top-left  top-right  bottom-right  bottom-left
+      const applyPos = (x, y) => {
+        const { sbX, sbY } = scrollbarSizes();
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const w  = this.offsetWidth;
+        const h  = this.offsetHeight;
+        const R  = 8; // default corner radius
+        const onL = x === 0;
+        const onR = x === vw - w - sbX;
+        const onT = y === 0;
+        const onB = y === vh - h - sbY;
+        // corner order: top-left top-right bottom-right bottom-left
+        const tl = (onT || onL) ? 0 : R;
+        const tr = (onT || onR) ? 0 : R;
+        const br = (onB || onR) ? 0 : R;
+        const bl = (onB || onL) ? 0 : R;
+        this.style.left         = x + 'px';
+        this.style.top          = y + 'px';
+        this.style.borderRadius = \`\${tl}px \${tr}px \${br}px \${bl}px\`;
+      };
+
+      // ── Restore saved position ──────────────────────────────────────────────
+      const saved = sessionStorage.getItem('__ss_menu_pos');
+      if (saved) {
+        try {
+          const { x, y } = JSON.parse(saved);
+          applyPos(x, y);
+        } catch (_) {
+          this.style.left = '4px';
+          this.style.top  = '50%';
+          this.style.transform = 'translateY(-50%)';
+        }
+      } else {
+        this.style.left = '4px';
+        this.style.top  = '50%';
+        this.style.transform = 'translateY(-50%)';
+      }
+
+      // ── Drag-to-move ──────────────────────────────────────────────────────
+      const handle = this._root.querySelector('.drag-handle');
+      handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        const rect = this.getBoundingClientRect();
+        // Clear percentage-based transform before dragging
+        this.style.transform = '';
+        this.style.top  = rect.top  + 'px';
+        this.style.left = rect.left + 'px';
+        this._dragOffX = e.clientX - rect.left;
+        this._dragOffY = e.clientY - rect.top;
+        this._dragging = true;
+      });
+      document.addEventListener('mousemove', (e) => {
+        if (!this._dragging) return;
+        const SNAP   = 8;
+        const { sbX, sbY } = scrollbarSizes();
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const w  = this.offsetWidth;
+        const h  = this.offsetHeight;
+        let x = Math.max(0, Math.min(e.clientX - this._dragOffX, vw - w - sbX));
+        let y = Math.max(0, Math.min(e.clientY - this._dragOffY, vh - h - sbY));
+        if (x <= SNAP)              x = 0;
+        if (x >= vw - w - sbX - SNAP) x = vw - w - sbX;
+        if (y <= SNAP)              y = 0;
+        if (y >= vh - h - sbY - SNAP) y = vh - h - sbY;
+        applyPos(x, y);
+      });
+      document.addEventListener('mouseup', () => {
+        if (!this._dragging) return;
+        this._dragging = false;
+        sessionStorage.setItem('__ss_menu_pos', JSON.stringify({
+          x: parseFloat(this.style.left),
+          y: parseFloat(this.style.top),
+        }));
+      });
+
+      // ── Visibility: mouse presence + page focus ───────────────────────────
+      const show = () => this.classList.add('ss-visible');
+      const hide = () => { if (!this._dragging) this.classList.remove('ss-visible'); };
+
+      // Show on mouse enter document body, hide on leave
+      document.addEventListener('mouseenter', show);
+      document.addEventListener('mouseleave', hide);
+
+      // Show when page is focused, hide when blurred
+      window.addEventListener('focus', show);
+      window.addEventListener('blur',  hide);
+
+      // Start visible if the page is already focused
+      if (document.hasFocus()) show();
+
+      // ── Hover to full opacity ─────────────────────────────────────────────
+      this.addEventListener('mouseenter', () => this.classList.add('ss-hovered'));
+      this.addEventListener('mouseleave', () => this.classList.remove('ss-hovered'));
+
+      // ── Variation switcher ────────────────────────────────────────────────
       const sel = this._root.querySelector('select');
       if (sel) {
         sel.addEventListener('change', async (e) => {
@@ -431,8 +662,7 @@ function buildInjectSnippet(ssOrigin) {
         });
       }
 
-      // Dispatch a bubbling event on the host element (which lives in the real DOM)
-      // so <ss-modal> — a sibling on document.body — can listen for it.
+      // ── Settings button → open modal ──────────────────────────────────────
       this._root.querySelector('.settings-btn').addEventListener('click', () => {
         this.dispatchEvent(new CustomEvent('ss-open-modal', { bubbles: true, composed: true }));
       });
@@ -527,6 +757,22 @@ function buildInjectSnippet(ssOrigin) {
             font-size: 13px; padding: 0 3px; line-height: 1; border-radius: 3px; flex-shrink: 0;
           }
           .btn-icon:hover { color: #ff6b6b; }
+          .toggle-btn {
+            background: none; border: none; cursor: pointer; padding: 0 2px;
+            border-radius: 3px; flex-shrink: 0; line-height: 1; color: #444;
+            font-size: 13px; transition: color .15s;
+          }
+          .toggle-btn:hover { color: #aaa; }
+          .toggle-btn.is-enabled { color: #7c7cff; }
+          .toggle-btn.is-enabled:hover { color: #a0a0ff; }
+          .var-card.var-disabled { opacity: .45; }
+          .mod-row.mod-disabled { opacity: .4; }
+          .eye-btn {
+            background: none; border: none; color: #555; cursor: pointer;
+            padding: 0 3px; line-height: 1; border-radius: 3px; flex-shrink: 0;
+            display: flex; align-items: center;
+          }
+          .eye-btn:hover { color: #ddd; }
           .save-flash { font-size: 11px; color: #7c7cff; opacity: 0; transition: opacity .3s; flex-shrink: 0; }
           .save-flash.show { opacity: 1; }
           .empty-note { color: #555; font-size: 12px; font-style: italic; }
@@ -617,6 +863,26 @@ function buildInjectSnippet(ssOrigin) {
           .log-lvl.warn  { color: #f5a623; }
           .log-lvl.error { color: #ff5f5f; }
           .log-msg { color: #bbb; word-break: break-all; }
+          /* ── Developer settings ── */
+          .settings-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px;
+            margin-bottom: 4px;
+          }
+          .check-label {
+            display: flex; align-items: center; gap: 7px;
+            font-size: 12px; color: #bbb; cursor: pointer; user-select: none;
+          }
+          .check-label:hover { color: #eee; }
+          .check-label input[type=checkbox] { accent-color: #7c7cff; cursor: pointer; width: 13px; height: 13px; }
+          .check-note { font-size: 10px; color: #555; margin-top: 2px; }
+          .num-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+          .num-label { font-size: 12px; color: #bbb; width: 160px; flex-shrink: 0; }
+          .num-input {
+            width: 90px; background: #2d2d44; color: #fff; border: 1px solid #3a3a55;
+            border-radius: 4px; padding: 4px 8px; font: 12px/1.4 inherit;
+          }
+          .num-input:focus { outline: none; border-color: #7c7cff; }
+          .num-unit { font-size: 11px; color: #555; }
         </style>
         <div class="overlay">
           <div class="modal" role="dialog" aria-modal="true" aria-label="ss Project Manager">
@@ -695,7 +961,7 @@ function buildInjectSnippet(ssOrigin) {
       this._activeTab = name;
       this._root.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
       const pane = this._root.querySelector('.tab-pane');
-      if (name === 'general')   { pane.innerHTML = this._tabGeneral();   }
+      if (name === 'general')   { pane.innerHTML = this._tabGeneral();   this._wireGeneral(); }
       if (name === 'pages')     { pane.innerHTML = this._tabPages();     this._wirePages(); }
       if (name === 'content')   { pane.innerHTML = this._tabContent();   this._wireContent(); }
       if (name === 'developer') { pane.innerHTML = this._tabDeveloper(); this._wireDeveloper(); }
@@ -708,12 +974,53 @@ function buildInjectSnippet(ssOrigin) {
       const varName = config.variation?.name || config.variation?.slug || '—';
       const varSlug = config.variation?.slug || '—';
       const modCount = (config.modifications || []).length;
+
+      // ── Page targeting match ──────────────────────────────────────────────
+      // Reconstruct the real target-site URL from the proxied path so we show
+      // (and evaluate targeting rules against) the URL the code will run on.
+      const _to = window.__ss?._targetOrigin;
+      const currentUrl = _to
+        ? _to + location.pathname + location.search + location.hash
+        : location.href;
+      const include = exp?.pages?.include || [];
+      const exclude = exp?.pages?.exclude || [];
+      let targeting = 'none'; // 'none' | 'match' | 'no-match'
+      if (include.length || exclude.length) {
+        const testUrl = (url, rule) => {
+          const r = typeof rule === 'object' ? rule : { rule: 'URL_CONTAINS', value: rule, options: {} };
+          const opts = r.options || {};
+          let u = url;
+          if (opts.ignore_protocol)     u = u.replace(/^https?:\\/\\//, '');
+          if (opts.ignore_query_string) u = u.split('?')[0];
+          if (opts.ignore_fragment)     u = u.split('#')[0];
+          const val = (opts.case_sensitive) ? r.value : r.value?.toLowerCase();
+          const tgt = (opts.case_sensitive) ? u       : u.toLowerCase();
+          switch (r.rule) {
+            case 'URL_MATCHES':    return tgt === val;
+            case 'URL_CONTAINS':   return tgt.includes(val);
+            case 'URL_STARTSWITH': return tgt.startsWith(val);
+            case 'URL_ENDSWITH':   return tgt.endsWith(val);
+            case 'URL_REGEX': try { return new RegExp(r.value, opts.case_sensitive ? '' : 'i').test(u); } catch { return false; }
+            default: return false;
+          }
+        };
+        const incMatch = !include.length || include.some(r => testUrl(currentUrl, r));
+        const excMatch =  exclude.length  && exclude.some(r => testUrl(currentUrl, r));
+        targeting = (incMatch && !excMatch) ? 'match' : 'no-match';
+      }
+      const targetIcon = targeting === 'match'    ? '<span style="color:#4caf50;font-size:15px" title="Page matches targeting rules">✓</span>'
+                       : targeting === 'no-match' ? '<span style="color:#f44336;font-size:15px" title="Page does not match targeting rules">✗</span>'
+                       : '';
+      const targetNote = targeting === 'none'     ? '<span style="color:#555;font-size:11px;font-style:italic">No targeting rules set</span>'
+                       : targeting === 'match'    ? '<span style="color:#4caf50;font-size:11px">Matches include rules</span>'
+                       : '<span style="color:#f44336;font-size:11px">Does not match include rules</span>';
+
       return \`
         <div class="section">
           <div class="section-title">Active Experience</div>
           <div class="field">
             <div class="field-label">Name</div>
-            <div class="field-value">\${exp?.name || '—'}</div>
+            <div class="field-value var-name" id="ss-exp-name" contenteditable="true" spellcheck="false" title="Click to rename">\${exp?.name || '—'}</div>
           </div>
           <div class="field">
             <div class="field-label">Slug</div>
@@ -735,7 +1042,36 @@ function buildInjectSnippet(ssOrigin) {
             <div class="field-value">\${modCount}</div>
           </div>
         </div>
+        <div class="section">
+          <div class="section-title">Current Page</div>
+          <div class="field">
+            <div class="field-label">URL</div>
+            <div class="field-value mono" style="word-break:break-all;font-size:11px">\${currentUrl}</div>
+          </div>
+          <div class="field">
+            <div class="field-label" style="display:flex;align-items:center;gap:5px">Targeting \${targetIcon}</div>
+            <div class="field-value">\${targetNote}</div>
+          </div>
+        </div>
       \`;
+    }
+
+    _wireGeneral() {
+      const pane = this._root.querySelector('.tab-pane');
+      const { config } = this._data;
+      const expSlug = config.experience?.slug;
+      const nameEl = pane.querySelector('#ss-exp-name');
+      if (!nameEl || !expSlug) return;
+      nameEl.addEventListener('focus', () => { nameEl.dataset.orig = nameEl.textContent; });
+      nameEl.addEventListener('blur', async () => {
+        const name = nameEl.textContent.trim();
+        if (!name || name === nameEl.dataset.orig) return;
+        await this._cmd({ action: 'rename-experience', expSlug, name });
+      });
+      nameEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); nameEl.blur(); }
+        if (e.key === 'Escape') { nameEl.textContent = nameEl.dataset.orig; nameEl.blur(); }
+      });
     }
 
     // ── Tab: Pages ──────────────────────────────────────────────────────────
@@ -924,21 +1260,29 @@ function buildInjectSnippet(ssOrigin) {
       if (!exp) return '<span class="empty-note">No active experience.</span>';
 
       const varCards = (exp.variations || []).map(v => {
-        const isControl = v.slug === 'control';
-        const isActive  = config.variation?.slug === v.slug;
-        const fileCount = (v.modifications || []).reduce((n, m) => n + (m.resources?.length || 0), 0);
+        const isControl  = v.slug === 'control';
+        const isActive   = config.variation?.slug === v.slug;
+        const isDisabled = v.enabled === false;
+        const fileCount  = (v.modifications || []).reduce((n, m) => n + (m.resources?.length || 0), 0);
 
-        const modRows = (v.modifications || []).map(m =>
-          \`<div class="mod-row" data-mod="\${m.slug}">
+        const modRows = (v.modifications || []).map(m => {
+          const modDisabled = m.enabled === false;
+          return \`<div class="mod-row\${modDisabled ? ' mod-disabled' : ''}" data-mod="\${m.slug}">
             \${isControl ? '' : \`<span class="drag-handle" title="Drag to reorder">⠿</span>\`}
             <span class="mod-name" \${isControl ? '' : 'contenteditable="true" spellcheck="false"'}>\${m.name}</span>
             <span class="badge badge-trigger">\${m.trigger || 'DOM_READY'}</span>
             <span class="mod-files">\${(m.resources||[]).length} file\${(m.resources||[]).length!==1?'s':''}</span>
-            \${isControl ? '' : \`<button class="btn-icon mod-del" data-mod="\${m.slug}" title="Delete modification">✕</button>\`}
-          </div>\`
-        ).join('');
+            \${isControl ? '' : \`
+              <button class="eye-btn" data-mod="\${m.slug}" title="View code">
+                <svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z"/><path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd"/></svg>
+              </button>
+              <button class="toggle-btn\${modDisabled ? '' : ' is-enabled'}" data-mod="\${m.slug}" title="\${modDisabled ? 'Enable block' : 'Disable block'}">⏻</button>
+              <button class="btn-icon mod-del" data-mod="\${m.slug}" title="Delete modification">✕</button>
+            \`}
+          </div>\`;
+        }).join('');
 
-        return \`<div class="var-card\${isControl ? ' var-control' : ''}" data-var="\${v.slug}">
+        return \`<div class="var-card\${isControl ? ' var-control' : ''}\${isDisabled ? ' var-disabled' : ''}" data-var="\${v.slug}">
           <div class="var-card-header">
             \${isControl ? '<span class="drag-placeholder"></span>' : '<span class="drag-handle var-drag" title="Drag to reorder">⠿</span>'}
             <label class="var-radio-label">
@@ -947,7 +1291,10 @@ function buildInjectSnippet(ssOrigin) {
             <span class="var-name" \${isControl ? '' : 'contenteditable="true" spellcheck="false"'}>\${v.name}</span>
             \${isActive ? '<span class="badge badge-active">active</span>' : ''}
             <span class="var-file-count">\${fileCount} file\${fileCount!==1?'s':''}</span>
-            \${isControl ? '' : \`<button class="btn-icon var-del" data-var="\${v.slug}" title="Delete variation">✕</button>\`}
+            \${isControl ? '' : \`
+              <button class="toggle-btn\${isDisabled ? '' : ' is-enabled'}" data-var="\${v.slug}" title="\${isDisabled ? 'Enable variation' : 'Disable variation'}">⏻</button>
+              <button class="btn-icon var-del" data-var="\${v.slug}" title="Delete variation">✕</button>
+            \`}
           </div>
           \${(v.modifications||[]).length ? \`<div class="mod-list" data-var="\${v.slug}">\${modRows}</div>\` : ''}
         </div>\`;
@@ -986,6 +1333,21 @@ function buildInjectSnippet(ssOrigin) {
         });
         el.addEventListener('focus', () => { el.dataset.orig = el.textContent; });
         el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
+      });
+
+      // ── Toggle variation enabled/disabled ────────────────────────────
+      pane.querySelectorAll('.var-card-header .toggle-btn[data-var]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const varSlug = btn.dataset.var;
+          const res = await this._cmd({ action: 'toggle-variation', varSlug, expSlug });
+          if (res.ok) {
+            const card = btn.closest('.var-card');
+            const nowDisabled = res.enabled === false;
+            card.classList.toggle('var-disabled', nowDisabled);
+            btn.classList.toggle('is-enabled', !nowDisabled);
+            btn.title = nowDisabled ? 'Enable variation' : 'Disable variation';
+          }
+        });
       });
 
       // ── Delete variation ──────────────────────────────────────────────
@@ -1060,6 +1422,38 @@ function buildInjectSnippet(ssOrigin) {
         });
       });
 
+      // ── Toggle modification enabled/disabled ─────────────────────────
+      pane.querySelectorAll('.mod-list .toggle-btn[data-mod]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const modSlug = btn.dataset.mod;
+          const varSlug = btn.closest('.mod-list').dataset.var;
+          const res = await this._cmd({ action: 'toggle-modification', varSlug, modSlug, expSlug });
+          if (res.ok) {
+            const row = btn.closest('.mod-row');
+            const nowDisabled = res.enabled === false;
+            row.classList.toggle('mod-disabled', nowDisabled);
+            btn.classList.toggle('is-enabled', !nowDisabled);
+            btn.title = nowDisabled ? 'Enable block' : 'Disable block';
+          }
+        });
+      });
+
+      // ── View modification code (eye icon) ─────────────────────────────
+      pane.querySelectorAll('.eye-btn[data-mod]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const modSlug = btn.dataset.mod;
+          const varSlug = btn.closest('.mod-list').dataset.var;
+          const { project, config } = this._data;
+          const expSlug2 = config.experience?.slug;
+          const exp2 = (project.experiences || []).find(e => e.slug === expSlug2);
+          const variation = exp2?.variations?.find(v => v.slug === varSlug);
+          const mod = variation?.modifications?.find(m => m.slug === modSlug);
+          if (!mod) return;
+          const viewer = document.querySelector('ss-code-viewer');
+          if (viewer) viewer.open(mod, expSlug2, varSlug, variation?.modifications || []);
+        });
+      });
+
       // ── Delete modification ───────────────────────────────────────────
       pane.querySelectorAll('.mod-del').forEach(btn => {
         btn.addEventListener('click', async () => {
@@ -1088,7 +1482,64 @@ function buildInjectSnippet(ssOrigin) {
 
     // ── Tab: Developer ──────────────────────────────────────────────────────
     _tabDeveloper() {
+      const cfg = this._data?.project?._settings || {};
+      const chk = (val) => val ? ' checked' : '';
       return \`
+        <div class="section">
+          <div class="section-title-row">
+            <span class="section-title" style="margin:0">Project Settings</span>
+            <span class="save-flash" id="ss-dev-save-msg">Saved</span>
+          </div>
+          <div class="section" style="margin-bottom:12px">
+            <div class="field-label" style="margin-bottom:6px">JS Tools</div>
+            <div class="settings-grid">
+              <label class="check-label">
+                <input type="checkbox" id="ss-inject-jquery"\${chk(cfg.inject_jquery)}/> jQuery 3
+              </label>
+              <label class="check-label">
+                <input type="checkbox" id="ss-inject-fa"\${chk(cfg.inject_fontawesome)}/> Font Awesome 6
+              </label>
+            </div>
+            <div class="check-note">Injected into every proxied page if not already present.</div>
+          </div>
+          <div class="section" style="margin-bottom:12px">
+            <div class="field-label" style="margin-bottom:6px">Single-Page App (SPA)</div>
+            <label class="check-label" style="margin-bottom:4px">
+              <input type="checkbox" id="ss-spa"\${chk(cfg.spa)}/>
+              Re-apply modifications on client-side route changes
+            </label>
+            <div class="check-note">Watches pushState / replaceState / popstate and re-applies all ss changes after each navigation.</div>
+          </div>
+          <div class="section" style="margin-bottom:12px">
+            <div class="field-label" style="margin-bottom:8px">Cache &amp; Timeouts</div>
+            <div class="num-row">
+              <span class="num-label">Resource cache TTL</span>
+              <input class="num-input" type="number" id="ss-cache-ttl" min="0" value="\${cfg.cache_ttl ?? 3600}"/>
+              <span class="num-unit">seconds</span>
+            </div>
+            <div class="num-row">
+              <span class="num-label">Page load timeout</span>
+              <input class="num-input" type="number" id="ss-timeout-ms" min="0" step="1000" value="\${cfg.timeout_ms ?? 30000}"/>
+              <span class="num-unit">ms</span>
+            </div>
+          </div>
+          <button class="btn btn-sm" id="ss-dev-save">Save settings</button>
+        </div>
+        <div class="section">
+          <div class="section-title">Timestamps</div>
+          <div class="field">
+            <div class="field-label">Last resource cache write</div>
+            <div class="field-value mono" id="ss-ts-cache">—</div>
+          </div>
+          <div class="field">
+            <div class="field-label">Last context capture (body.html)</div>
+            <div class="field-value mono" id="ss-ts-context">—</div>
+          </div>
+          <div class="field">
+            <div class="field-label">Last screenshot</div>
+            <div class="field-value mono" id="ss-ts-screenshots">—</div>
+          </div>
+        </div>
         <div class="section">
           <div class="section-title">config.json</div>
           <pre class="code-block" id="ss-raw-config">Loading...</pre>
@@ -1102,6 +1553,44 @@ function buildInjectSnippet(ssOrigin) {
       \`;
     }
     _wireDeveloper() {
+      const pane = this._root.querySelector('.tab-pane');
+
+      // ── Settings save ─────────────────────────────────────────────────────
+      pane.querySelector('#ss-dev-save').addEventListener('click', async () => {
+        const payload = {
+          action: 'update-project-settings',
+          inject_jquery:      pane.querySelector('#ss-inject-jquery').checked,
+          inject_fontawesome: pane.querySelector('#ss-inject-fa').checked,
+          spa:                pane.querySelector('#ss-spa').checked,
+          cache_ttl:          parseInt(pane.querySelector('#ss-cache-ttl').value,  10) || 0,
+          timeout_ms:         parseInt(pane.querySelector('#ss-timeout-ms').value, 10) || 0,
+        };
+        const res = await this._cmd(payload);
+        if (res.ok) {
+          // Reflect into cached project settings so re-opening the tab is current
+          if (!this._data.project._settings) this._data.project._settings = {};
+          Object.assign(this._data.project._settings, payload);
+          const msg = pane.querySelector('#ss-dev-save-msg');
+          msg.classList.add('show');
+          setTimeout(() => msg.classList.remove('show'), 2000);
+        }
+      });
+
+      // ── Timestamps ────────────────────────────────────────────────────────
+      fetch('${ssOrigin}/__ss__/status')
+        .then(r => r.json())
+        .then(status => {
+          const fmt = (ms) => ms ? new Date(ms).toLocaleString() : 'Never';
+          const cacheEl  = this._root.querySelector('#ss-ts-cache');
+          const ctxEl    = this._root.querySelector('#ss-ts-context');
+          const shotsEl  = this._root.querySelector('#ss-ts-screenshots');
+          if (cacheEl)  cacheEl.textContent  = fmt(status.cache);
+          if (ctxEl)    ctxEl.textContent    = fmt(status.context);
+          if (shotsEl)  shotsEl.textContent  = fmt(status.screenshots);
+        })
+        .catch(() => {});
+
+      // ── Raw config ────────────────────────────────────────────────────────
       fetch('${ssOrigin}/__ss__/raw-config')
         .then(r => r.json())
         .then(cfg => {
@@ -1113,6 +1602,7 @@ function buildInjectSnippet(ssOrigin) {
           if (el) el.textContent = 'Could not load config.';
         });
 
+      // ── Logs ──────────────────────────────────────────────────────────────
       fetch('${ssOrigin}/__ss__/logs')
         .then(r => r.json())
         .then(logs => {
@@ -1139,14 +1629,334 @@ function buildInjectSnippet(ssOrigin) {
     }
   }
 
+  // ── <ss-code-viewer> web component ────────────────────────────────────────
+  // Monaco-backed read-only code viewer with editable trigger settings.
+  // Opens on top of the modal (z-index 2147483648).
+  // Usage: document.querySelector('ss-code-viewer').open(modData, expSlug, varSlug)
+  class SsCodeViewer extends HTMLElement {
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'closed' });
+      this._editor = null;
+      this._modData = null;
+      this._ws = null;
+    }
+
+    connectedCallback() {
+      this._root.innerHTML = \`
+        <style>
+          :host { display: contents; }
+          * { box-sizing: border-box; }
+          .cv-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,.72); z-index: 2147483648;
+            align-items: center; justify-content: center;
+          }
+          .cv-overlay.open { display: flex; }
+          .cv-modal {
+            background: #1a1a2e; color: #eee;
+            border-radius: 10px; box-shadow: 0 8px 48px rgba(0,0,0,.85);
+            width: min(960px, 96vw); height: min(680px, 90vh);
+            display: flex; flex-direction: column;
+            font: 13px/1.5 -apple-system, system-ui, sans-serif;
+            overflow: hidden;
+          }
+          .cv-header {
+            display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+            padding: 10px 16px; border-bottom: 1px solid #2d2d44; flex-shrink: 0;
+          }
+          .cv-mod-name { font-weight: 600; font-size: 14px; }
+          .cv-settings {
+            display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: 1;
+          }
+          .cv-label { font-size: 11px; color: #666; }
+          .cv-select {
+            background: #2d2d44; color: #fff; border: 1px solid #3a3a55;
+            border-radius: 4px; padding: 3px 8px; font: 12px/1.4 inherit; cursor: pointer;
+          }
+          .cv-select:focus { outline: none; border-color: #7c7cff; }
+          .cv-input {
+            background: #2d2d44; color: #fff; border: 1px solid #3a3a55;
+            border-radius: 4px; padding: 3px 8px; font: 12px/1.4 inherit; width: 180px;
+          }
+          .cv-input:focus { outline: none; border-color: #7c7cff; }
+          .cv-dirty-row {
+            display: none; align-items: center; gap: 6px;
+          }
+          .cv-dirty-row.visible { display: flex; }
+          .cv-save-btn {
+            background: #7c7cff; color: #fff; border: none; border-radius: 4px;
+            padding: 3px 12px; font: 12px inherit; cursor: pointer;
+          }
+          .cv-save-btn:hover { background: #6a6aee; }
+          .cv-cancel-btn {
+            background: none; color: #aaa; border: 1px solid #444; border-radius: 4px;
+            padding: 3px 10px; font: 12px inherit; cursor: pointer;
+          }
+          .cv-cancel-btn:hover { color: #fff; border-color: #777; }
+          .cv-save-flash { font-size: 11px; color: #7c7cff; }
+          .cv-close {
+            margin-left: auto; background: none; border: none; color: #666;
+            cursor: pointer; font-size: 22px; line-height: 1; padding: 0 4px; border-radius: 4px;
+          }
+          .cv-close:hover { color: #fff; }
+          .cv-tabs {
+            display: flex; border-bottom: 1px solid #2d2d44; background: #13132a;
+            flex-shrink: 0; overflow-x: auto;
+          }
+          .cv-tab {
+            background: none; border: none; border-bottom: 2px solid transparent;
+            color: #777; padding: 8px 16px; font: inherit; font-size: 12px;
+            cursor: pointer; white-space: nowrap; flex-shrink: 0;
+          }
+          .cv-tab:hover { color: #ddd; }
+          .cv-tab.active { color: #fff; border-bottom-color: #7c7cff; }
+          .cv-editor-wrap { flex: 1; overflow: hidden; position: relative; }
+          .cv-loading {
+            position: absolute; inset: 0; display: flex; align-items: center;
+            justify-content: center; color: #555; font-size: 13px;
+          }
+        </style>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/editor/editor.main.css"/>
+        <div class="cv-overlay">
+          <div class="cv-modal">
+            <div class="cv-header">
+              <span class="cv-mod-name"></span>
+              <div class="cv-settings">
+                <span class="cv-label">Trigger</span>
+                <select class="cv-select cv-trigger-sel">
+                  <option value="IMMEDIATE">IMMEDIATE</option>
+                  <option value="DOM_READY">DOM_READY</option>
+                  <option value="ELEMENT_LOADED">ELEMENT_LOADED</option>
+                  <option value="AFTER_CODE_BLOCK">AFTER_CODE_BLOCK</option>
+                </select>
+                <input class="cv-input cv-selector-input" placeholder="CSS selector" style="display:none"/>
+                <select class="cv-select cv-dependency-sel" style="display:none"></select>
+                <div class="cv-dirty-row">
+                  <button class="cv-save-btn">Save</button>
+                  <button class="cv-cancel-btn">Cancel</button>
+                  <span class="cv-save-flash" style="display:none">Saved</span>
+                </div>
+              </div>
+              <button class="cv-close">&times;</button>
+            </div>
+            <div class="cv-tabs"></div>
+            <div class="cv-editor-wrap">
+              <div class="cv-loading">Loading editor…</div>
+            </div>
+          </div>
+        </div>
+      \`;
+
+      const overlay = this._root.querySelector('.cv-overlay');
+      this._root.querySelector('.cv-close').addEventListener('click', () => this._close());
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) this._close(); });
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && overlay.classList.contains('open')) this._close();
+      });
+
+      // Track dirty state when trigger settings change
+      const trigSel  = this._root.querySelector('.cv-trigger-sel');
+      const selInput = this._root.querySelector('.cv-selector-input');
+      const depSel   = this._root.querySelector('.cv-dependency-sel');
+      const dirtyRow = this._root.querySelector('.cv-dirty-row');
+      const saveBtn  = this._root.querySelector('.cv-save-btn');
+      const cancelBtn= this._root.querySelector('.cv-cancel-btn');
+
+      const updateExtras = () => {
+        selInput.style.display = trigSel.value === 'ELEMENT_LOADED'   ? '' : 'none';
+        depSel.style.display   = trigSel.value === 'AFTER_CODE_BLOCK' ? '' : 'none';
+      };
+      const markDirty = () => { dirtyRow.classList.add('visible'); };
+      trigSel.addEventListener('change', () => { updateExtras(); markDirty(); });
+      selInput.addEventListener('input', markDirty);
+      depSel.addEventListener('change', markDirty);
+
+      saveBtn.addEventListener('click', async () => {
+        const flash = this._root.querySelector('.cv-save-flash');
+        const payload = {
+          action: 'update-modification-trigger',
+          expSlug: this._expSlug,
+          varSlug: this._varSlug,
+          modSlug: this._modData.slug,
+          trigger: trigSel.value,
+        };
+        if (trigSel.value === 'ELEMENT_LOADED')    payload.selector   = selInput.value.trim();
+        if (trigSel.value === 'AFTER_CODE_BLOCK')  payload.dependency = depSel.value;
+        const res = await this._cmd(payload);
+        if (res.ok) {
+          dirtyRow.classList.remove('visible');
+          flash.style.display = '';
+          setTimeout(() => { flash.style.display = 'none'; }, 1800);
+          this._modData.trigger    = trigSel.value;
+          this._modData.dependency = depSel.value;
+        }
+      });
+
+      cancelBtn.addEventListener('click', () => {
+        this._resetTriggerUi();
+        dirtyRow.classList.remove('visible');
+      });
+    }
+
+    _resetTriggerUi() {
+      const mod      = this._modData;
+      const allMods  = this._allMods || [];
+      const trigSel  = this._root.querySelector('.cv-trigger-sel');
+      const selInput = this._root.querySelector('.cv-selector-input');
+      const depSel   = this._root.querySelector('.cv-dependency-sel');
+
+      trigSel.value  = mod.trigger || 'DOM_READY';
+      selInput.value = mod.selector || '';
+
+      // Populate dependency dropdown with other blocks in the same variation
+      const others = allMods.filter(m => m.slug !== mod.slug);
+      depSel.innerHTML = others.length
+        ? others.map(m =>
+            \`<option value="\${m.slug}"\${m.slug === mod.dependency ? ' selected' : ''}>\${m.name} (\${m.slug})</option>\`
+          ).join('')
+        : '<option value="" disabled>No other blocks in this variation</option>';
+      if (mod.dependency && others.some(m => m.slug === mod.dependency)) {
+        depSel.value = mod.dependency;
+      }
+
+      selInput.style.display = trigSel.value === 'ELEMENT_LOADED'   ? '' : 'none';
+      depSel.style.display   = trigSel.value === 'AFTER_CODE_BLOCK' ? '' : 'none';
+    }
+
+    _cmd(payload) {
+      return new Promise((resolve) => {
+        if (!this._ws || this._ws.readyState !== 1) {
+          this._ws = new WebSocket('${wsUrl}');
+        }
+        const id = Math.random().toString(36).slice(2);
+        const msg = JSON.stringify({ ...payload, id });
+        const handler = (e) => {
+          let data; try { data = JSON.parse(e.data); } catch { return; }
+          if (data.type === 'cmd-result' && data.id === id) {
+            this._ws.removeEventListener('message', handler);
+            resolve(data);
+          }
+        };
+        if (this._ws.readyState === 1) {
+          this._ws.addEventListener('message', handler);
+          this._ws.send(msg);
+        } else {
+          this._ws.addEventListener('open', () => {
+            this._ws.addEventListener('message', handler);
+            this._ws.send(msg);
+          });
+        }
+      });
+    }
+
+    open(modData, expSlug, varSlug, allMods) {
+      this._modData = modData;
+      this._expSlug = expSlug;
+      this._varSlug = varSlug;
+      this._allMods = allMods || [];
+
+      this._root.querySelector('.cv-mod-name').textContent = modData.name || modData.slug;
+      this._resetTriggerUi();
+      this._root.querySelector('.cv-dirty-row').classList.remove('visible');
+      this._root.querySelector('.cv-save-flash').style.display = 'none';
+
+      // Build tabs
+      const tabsEl  = this._root.querySelector('.cv-tabs');
+      const allFiles = modData.resources || [];
+      tabsEl.innerHTML = allFiles.map((f, i) =>
+        \`<button class="cv-tab\${i === 0 ? ' active' : ''}" data-file="\${f}">\${f}</button>\`
+      ).join('');
+      tabsEl.querySelectorAll('.cv-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+          tabsEl.querySelectorAll('.cv-tab').forEach(t => t.classList.remove('active'));
+          tab.classList.add('active');
+          this._loadFile(tab.dataset.file);
+        });
+      });
+
+      this._root.querySelector('.cv-overlay').classList.add('open');
+      this._initMonaco().then(() => {
+        if (allFiles.length) this._loadFile(allFiles[0]);
+      });
+    }
+
+    _close() {
+      this._root.querySelector('.cv-overlay').classList.remove('open');
+    }
+
+    async _initMonaco() {
+      if (window.monaco) {
+        if (!this._editor) this._createEditor();
+        return;
+      }
+      if (!window.__ss_monaco_loading) {
+        window.__ss_monaco_loading = new Promise((resolve) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.min.js';
+          script.onload = () => {
+            window.require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs' } });
+            window.require(['vs/editor/editor.main'], resolve);
+          };
+          document.head.appendChild(script);
+        });
+      }
+      await window.__ss_monaco_loading;
+      if (!this._editor) this._createEditor();
+    }
+
+    _createEditor() {
+      const wrap    = this._root.querySelector('.cv-editor-wrap');
+      const loading = wrap.querySelector('.cv-loading');
+      const container = document.createElement('div');
+      container.style.cssText = 'position:absolute;inset:0;';
+      wrap.appendChild(container);
+      if (loading) loading.remove();
+      this._editor = window.monaco.editor.create(container, {
+        value: '',
+        language: 'javascript',
+        readOnly: true,
+        theme: 'vs-dark',
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        fontSize: 12,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        automaticLayout: true,
+      });
+    }
+
+    async _loadFile(filename) {
+      if (!filename) return;
+      try {
+        const url = '${ssOrigin}/__ss__/file-content?exp=' + encodeURIComponent(this._expSlug)
+          + '&var=' + encodeURIComponent(this._varSlug)
+          + '&mod=' + encodeURIComponent(this._modData.slug)
+          + '&file=' + encodeURIComponent(filename);
+        const { content } = await fetch(url).then(r => r.json());
+        if (!this._editor) return;
+        const ext = filename.split('.').pop().toLowerCase();
+        const langMap = { js:'javascript', mjs:'javascript', cjs:'javascript', ts:'typescript', tsx:'typescript', jsx:'javascript', css:'css', scss:'scss', sass:'scss', html:'html' };
+        const lang = langMap[ext] || 'plaintext';
+        const oldModel = this._editor.getModel();
+        const newModel = window.monaco.editor.createModel(content || '', lang);
+        this._editor.setModel(newModel);
+        if (oldModel) oldModel.dispose();
+      } catch (_) {}
+    }
+  }
+
   if (!customElements.get('ss-floating-menu')) {
     customElements.define('ss-floating-menu', SsFloatingMenu);
   }
   if (!customElements.get('ss-modal')) {
     customElements.define('ss-modal', SsModal);
   }
+  if (!customElements.get('ss-code-viewer')) {
+    customElements.define('ss-code-viewer', SsCodeViewer);
+  }
   document.body.appendChild(document.createElement('ss-floating-menu'));
   document.body.appendChild(document.createElement('ss-modal'));
+  document.body.appendChild(document.createElement('ss-code-viewer'));
 </script>`;
 }
 
@@ -1322,6 +2132,64 @@ async function handleCommand(msg, broadcast, reply) {
       break;
     }
 
+    case 'rename-experience': {
+      if (!msg.name?.trim()) return reply({ ok: false, error: 'Name required' });
+      exp.name = msg.name.trim();
+      saveConfig(config);
+      reply({ ok: true });
+      break;
+    }
+
+    case 'toggle-variation': {
+      const v = exp.variations?.find((v) => v.slug === msg.varSlug);
+      if (!v) return reply({ ok: false, error: 'Variation not found' });
+      if (msg.varSlug === 'control') return reply({ ok: false, error: 'Cannot disable Control' });
+      v.enabled = v.enabled === false ? true : false;
+      saveConfig(config);
+      reply({ ok: true, enabled: v.enabled });
+      break;
+    }
+
+    case 'toggle-modification': {
+      const v = exp.variations?.find((v) => v.slug === msg.varSlug);
+      const m = v?.modifications?.find((m) => m.slug === msg.modSlug);
+      if (!m) return reply({ ok: false, error: 'Modification not found' });
+      m.enabled = m.enabled === false ? true : false;
+      saveConfig(config);
+      writeCacheEntry(expSlug, msg.varSlug);
+      reply({ ok: true, enabled: m.enabled });
+      break;
+    }
+
+    case 'update-project-settings': {
+      if (!config.settings) config.settings = {};
+      if (typeof msg.inject_jquery      === 'boolean') config.settings.inject_jquery      = msg.inject_jquery;
+      if (typeof msg.inject_fontawesome === 'boolean') config.settings.inject_fontawesome = msg.inject_fontawesome;
+      if (typeof msg.spa                === 'boolean') config.settings.spa                = msg.spa;
+      if (typeof msg.cache_ttl          === 'number')  config.settings.cache_ttl          = msg.cache_ttl;
+      if (typeof msg.timeout_ms         === 'number')  config.settings.timeout_ms         = msg.timeout_ms;
+      saveConfig(config);
+      reply({ ok: true });
+      // No reload needed — tool injections and SPA mode take effect on the next page load.
+      break;
+    }
+
+    case 'update-modification-trigger': {
+      const v = exp.variations?.find((v) => v.slug === msg.varSlug);
+      const m = v?.modifications?.find((m) => m.slug === msg.modSlug);
+      if (!m) return reply({ ok: false, error: 'Modification not found' });
+      const TRIGGERS = ['IMMEDIATE', 'DOM_READY', 'ELEMENT_LOADED', 'AFTER_CODE_BLOCK'];
+      if (!TRIGGERS.includes(msg.trigger)) return reply({ ok: false, error: 'Invalid trigger' });
+      m.trigger = msg.trigger;
+      if (msg.trigger === 'ELEMENT_LOADED')   { m.selector   = msg.selector   || ''; delete m.dependency; }
+      else if (msg.trigger === 'AFTER_CODE_BLOCK') { m.dependency = msg.dependency || ''; delete m.selector; }
+      else { delete m.selector; delete m.dependency; }
+      saveConfig(config);
+      writeCacheEntry(expSlug, msg.varSlug);
+      reply({ ok: true });
+      break;
+    }
+
     default:
       reply({ ok: false, error: `Unknown action: ${msg.action}` });
   }
@@ -1388,6 +2256,7 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
     res.json({
       experiences: config.experiences || [],
       editorUrl: exp?.pages?.editor || '',
+      _settings: config.settings || {},
     });
   });
 
@@ -1451,6 +2320,44 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
   // ── ROUTE 8: In-memory log buffer for the Developer tab ──────────────────
   app.get("/__ss__/logs", (_req, res) => {
     res.json(_logs);
+  });
+
+  // ── ROUTE 9b: HTML snippet for SPA re-apply ──────────────────────────────
+  app.get("/__ss__/html-snippet", (_req, res) => {
+    res.json({ html: loadVariationHtml() });
+  });
+
+  // ── ROUTE 9: Timestamps for Developer tab (cache + context mtimes) ────────
+  app.get("/__ss__/status", (_req, res) => {
+    const result = { cache: null, context: null, screenshots: null };
+
+    // Last cache write — stat the domain subdirectory
+    const cacheSubdir = join(CACHE_DIR, targetDomain.replace(/[^a-zA-Z0-9.-]/g, '_'));
+    try { result.cache = statSync(cacheSubdir).mtimeMs; } catch (_) {}
+
+    // Last context capture — body.html and desktop screenshot
+    try { result.context     = statSync(join(process.cwd(), '.context', 'content', 'body.html')).mtimeMs; } catch (_) {}
+    try { result.screenshots = statSync(join(process.cwd(), '.context', 'screenshots', 'desktop.png')).mtimeMs; } catch (_) {}
+
+    res.json(result);
+  });
+
+  // ── ROUTE 10: Serve a single modification file for the code viewer ─────────
+  app.get("/__ss__/file-content", (req, res) => {
+    const { exp: expQ, var: varQ, mod: modQ, file: fileQ } = req.query;
+    const slugRe = /^[a-z0-9-]+$/;
+    const fileRe = /^[\w.-]+\.(js|ts|tsx|jsx|mjs|cjs|css|scss|sass|html)$/i;
+    if (!expQ || !varQ || !modQ || !fileQ
+        || !slugRe.test(expQ) || !slugRe.test(varQ) || !slugRe.test(modQ)
+        || !fileRe.test(fileQ)) {
+      return res.status(400).json({ error: 'Invalid params' });
+    }
+    const filePath = join(process.cwd(), 'experiences', expQ, varQ, modQ, fileQ);
+    try {
+      res.json({ content: readFileSync(filePath, 'utf8') });
+    } catch (_) {
+      res.json({ content: '' });
+    }
   });
 
   // ── MIDDLEWARE: Local resource cache ─────────────────────────────────────
@@ -1560,11 +2467,22 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
     );
   }
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server = app.listen(port, () => {
       console.log(`\n✔ Proxy running → http://localhost:${port}`);
       console.log(`  Mirroring: ${targetUrl}\n`);
       resolve(broadcast);
+    });
+
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`\n✖ Port ${port} is already in use.`);
+        console.error(`  Another ss server may be running. Try:`);
+        console.error(`    ss stop               (stop a background server)`);
+        console.error(`    ss start --port 3001  (use a different port)`);
+        process.exit(1);
+      }
+      reject(err);
     });
 
     // WebSocket server — shares the same HTTP server, handles /__ss__/ws upgrades.
@@ -1579,6 +2497,10 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
         }
       }
     };
+
+    // Absorb WSS-level errors (e.g. if the underlying server fails to bind).
+    // The server 'error' handler above already calls process.exit for EADDRINUSE.
+    wss.on('error', (_err) => {});
 
     // Handle inbound command messages from <ss-modal>.
     // Each message must have a unique { id } so the reply can be matched.

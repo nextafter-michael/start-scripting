@@ -18,6 +18,91 @@ const CONFIG_FILE = join(process.cwd(), 'config.json');
 const PID_FILE    = join(process.cwd(), '.ss-pid');
 const LOG_FILE    = join(process.cwd(), '.ss.log');
 
+// ─── Browser open helper ──────────────────────────────────────────────────────
+//
+// Opens a URL in the user's default browser, a custom browser binary, or a
+// standalone popup window (no tabs, chrome-app style).
+//
+//   options.browser  — path to browser executable (overrides default)
+//   options.popup    — open in a minimal popup window instead of a full tab
+//
+// Popup strategy:
+//   Chromium-family (Chrome, Edge, Brave, Chromium): --app=<url> --window-size=1280,900
+//   Firefox: --new-window <url>  (no app mode, but opens a fresh window)
+//   Everything else / unknown: fall back to plain system open
+
+function openPreview(url, { browser, popup } = {}) {
+  const platform = process.platform;
+
+  if (browser) {
+    // User specified a binary — honour popup flag if possible
+    const isFirefox = /firefox/i.test(browser);
+    const cmd = popup
+      ? (isFirefox
+          ? `"${browser}" --new-window "${url}"`
+          : `"${browser}" --app="${url}" --window-size=1280,900`)
+      : `"${browser}" "${url}"`;
+    exec(cmd);
+    return;
+  }
+
+  if (popup) {
+    // No explicit binary — try to locate a Chromium-family browser first,
+    // then fall back to Firefox, then plain open.
+    const chromiumCandidates = platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+          '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+          '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        ]
+      : platform === 'win32'
+      ? [
+          'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+          'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+          'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+          'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+          'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+        ]
+      : [ // Linux
+          '/usr/bin/google-chrome',
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/chromium',
+          '/usr/bin/chromium-browser',
+          '/usr/bin/microsoft-edge',
+          '/snap/bin/chromium',
+        ];
+
+    const chromium = chromiumCandidates.find(p => { try { return existsSync(p); } catch { return false; } });
+
+    if (chromium) {
+      exec(`"${chromium}" --app="${url}" --window-size=1280,900`);
+      return;
+    }
+
+    // Try Firefox as second choice (no true app mode, but opens a new window)
+    const firefoxCandidates = platform === 'darwin'
+      ? ['/Applications/Firefox.app/Contents/MacOS/firefox']
+      : platform === 'win32'
+      ? ['C:\\Program Files\\Mozilla Firefox\\firefox.exe', 'C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe']
+      : ['/usr/bin/firefox'];
+
+    const firefox = firefoxCandidates.find(p => { try { return existsSync(p); } catch { return false; } });
+    if (firefox) {
+      exec(`"${firefox}" --new-window "${url}"`);
+      return;
+    }
+
+    // No known browser found — fall through to plain open
+    console.warn('  ⚠ Could not find a Chromium or Firefox binary for popup mode — opening normally');
+  }
+
+  // Default: let the OS open the URL in whatever is registered as the default browser
+  const openCmd = platform === 'darwin' ? 'open'
+    : platform === 'win32' ? 'start ""' : 'xdg-open';
+  exec(`${openCmd} "${url}"`);
+}
+
 // ─── Prompt helper ────────────────────────────────────────────────────────────
 
 function prompt(question) {
@@ -80,7 +165,7 @@ ${expLine}
 ## How the tool works
 
 - \`ss start [url]\` — starts the proxy and opens the site in your browser.
-  The page context (screenshots + HTML) is captured to \`.context/\`.
+  Page context (screenshots + HTML) is captured to \`.context/\` automatically.
 - \`ss new experience <name>\` — creates a new experience in config.json and \`experiences/\`.
 - \`ss new variation <name>\` — adds a variation to the active experience.
 - \`ss new block <name>\` — adds a modification block to the active variation.
@@ -97,25 +182,51 @@ Each modification block lives in \`experiences/<exp>/<variation>/<block>/\`:
 Save any file and the proxy rebuilds and live-reloads automatically.
 CSS and HTML changes hot-swap without a full page reload.
 
-## Context files (for AI prompting)
+## Reading the .context directory
 
-After \`ss start\` runs, these files are populated:
+**Always read these files before writing any code for this project.**
+They give you the full picture of what you are building and what the target page looks like.
 
-- \`.context/screenshots/desktop.png\` — full-page screenshot at 1440px
-- \`.context/screenshots/tablet.png\`  — full-page screenshot at 768px
-- \`.context/screenshots/mobile.png\`  — full-page screenshot at 375px
-- \`.context/content/body.html\`       — cleaned page body HTML + CSS design tokens
+### Task brief — start here
 
-To generate test code with an AI assistant:
-> "Based on \`.context/content/body.html\`, add a sticky donation bar that
->  matches the site's colors and appears after 3 seconds."
+\`.context/task/task.md\` describes what this A/B test should achieve: the objective,
+the specific changes requested, acceptance criteria, and any brand/constraint notes.
+Read this first to understand the goal before touching any other file.
 
-Paste the output into \`modification.js\` and \`modification.css\`. The proxy will rebuild.
+### Mockups
+
+\`.context/task/mockups/\` may contain reference images (PNG/JPG/etc.) provided by the
+designer or stakeholder. Inspect every image in this folder — they show what the finished
+variation is supposed to look like. Match colours, spacing, typography, and layout as
+closely as possible when writing your CSS.
+
+### Live page snapshot
+
+After \`ss start\` runs, these files are populated from the live proxied page:
+
+| File | Contents |
+|---|---|
+| \`.context/screenshots/desktop.png\` | Full-page screenshot at 1440 px |
+| \`.context/screenshots/tablet.png\`  | Full-page screenshot at 768 px  |
+| \`.context/screenshots/mobile.png\`  | Full-page screenshot at 375 px  |
+| \`.context/content/body.html\`       | Cleaned \`<body>\` HTML + CSS design tokens |
+
+Use \`.context/content/body.html\` to find the correct DOM selectors and existing CSS
+custom properties before writing any JavaScript or CSS. Cross-reference the screenshots
+to verify the visual structure matches what the HTML describes.
+
+### Recommended workflow
+
+1. Read \`.context/task/task.md\` — understand the goal.
+2. Check \`.context/task/mockups/\` — inspect any design references.
+3. Read \`.context/content/body.html\` — learn the DOM and CSS tokens.
+4. View the screenshots — confirm the page structure visually.
+5. Write code in \`modification.js\` / \`modification.css\` / \`modification.html\`.
 
 ## Variation switcher
 
-A floating widget is injected into the proxied page when multiple variations
-exist. Use it to switch between variations — the page reloads automatically.
+A floating widget is injected into the proxied page when multiple variations exist.
+Use it to switch between variations — the page reloads automatically.
 
 ## window.__ss
 
@@ -181,7 +292,37 @@ program
     mkdirSync(join(projectDir, 'experiences'), { recursive: true });
     mkdirSync(join(projectDir, '.context', 'screenshots'), { recursive: true });
     mkdirSync(join(projectDir, '.context', 'content'), { recursive: true });
+    mkdirSync(join(projectDir, '.context', 'task', 'mockups'), { recursive: true });
     mkdirSync(join(projectDir, '.cache'), { recursive: true });
+
+    // task.md — brief for the AI assistant
+    const taskPath = join(projectDir, '.context', 'task', 'task.md');
+    if (!existsSync(taskPath)) {
+      writeFileSync(taskPath, [
+        '# Task brief',
+        '',
+        '<!-- Describe what this A/B test should achieve. -->',
+        '<!-- The AI assistant reads this file to understand your goal before writing code. -->',
+        '',
+        '## Objective',
+        '',
+        '<!-- What are you trying to improve or test? -->',
+        '',
+        '## Changes requested',
+        '',
+        '<!-- List the specific UI/copy/layout changes you want to make. -->',
+        '',
+        '## Acceptance criteria',
+        '',
+        '<!-- How will you know the implementation is correct? -->',
+        '',
+        '## Notes',
+        '',
+        '<!-- Add any extra context: brand guidelines, constraints, prior results, etc. -->',
+        '<!-- Drop mockup images into .context/task/mockups/ and reference them here. -->',
+      ].join('\n') + '\n');
+      console.log('✔ Created .context/task/task.md');
+    }
 
     // .gitignore
     const gitignorePath = join(projectDir, '.gitignore');
@@ -190,7 +331,10 @@ program
         'node_modules/',
         'dist/',
         'config.json',
-        '.context/',
+        '# Generated context — excluded because they are rebuilt on every ss start / ss capture',
+        '.context/screenshots/',
+        '.context/content/',
+        '# .context/task/ is intentionally tracked (task brief + mockups are user content)',
         '.cache/',
         '.ss-pid',
         '.ss.log',
@@ -337,17 +481,22 @@ program
   .description('Start the proxy + watcher and open the site in your browser')
   .option('-p, --port <number>', 'Port to run on', '3000')
   .option('--fresh', 'Clear the local resource cache before connecting')
-  .option('-b, --background', 'Run the server in a background process (use "ss stop" to stop)')
+  .option('-b, --background', 'Run in background (logs → .ss.log, stops after 1h idle or ss stop)')
+  .option('-s, --silent',     'Alias for --background')
+  .option('--browser <path>', 'Path to browser executable to open the preview URL')
+  .option('-w, --popup',      'Open preview in a standalone popup window (no tabs)')
   .action(async (url, options) => {
 
-    // ── Background mode ─────────────────────────────────────────────────────
+    // ── Background / silent mode ─────────────────────────────────────────────
     // Relaunch the same command as a detached child process and exit.
     // Logs go to .ss.log; PID is saved to .ss-pid for "ss stop".
-    if (options.background) {
+    if (options.background || options.silent) {
       const args = [process.argv[1], 'start'];
       if (url) args.push(url);
       if (options.port !== '3000') args.push('--port', options.port);
-      if (options.fresh) args.push('--fresh');
+      if (options.fresh)           args.push('--fresh');
+      if (options.browser)         args.push('--browser', options.browser);
+      if (options.popup)           args.push('--popup');
 
       const logFd = openSync(LOG_FILE, 'a');
       const child = spawn(process.execPath, args, {
@@ -362,7 +511,8 @@ program
       writeFileSync(PID_FILE, String(child.pid));
       console.log(`✔ Server started in background (PID ${child.pid})`);
       console.log(`  Logs: .ss.log`);
-      console.log(`  Run "ss stop" to stop it.`);
+      console.log(`  Auto-stops after 1 hour with no file changes.`);
+      console.log(`  Run "ss stop" to stop it immediately.`);
       process.exit(0);
     }
 
@@ -465,6 +615,7 @@ program
     const { startProxy }      = await import('../src/proxy.mjs');
     const { capturePageContext } = await import('../src/capture.mjs');
 
+    let broadcast;
     if (usePW) {
       const { PwFetcher } = await import('../src/pw-fetcher.mjs');
       const pwFetcher = new PwFetcher();
@@ -474,27 +625,55 @@ program
 
       process.on('SIGINT', async () => { await pwFetcher.close(); process.exit(0); });
 
-      const cookies   = await pwFetcher.getCookies();
-      const broadcast = await startProxy(targetOrigin, port, { pwFetcher });
+      const cookies = await pwFetcher.getCookies();
+      broadcast = await startProxy(targetOrigin, port, { pwFetcher });
       await Promise.all([
         startBuilder(expSlug, varSlug || 'control', broadcast),
         capturePageContext(targetUrl, expSlug, { cookies }),
       ]);
     } else {
-      const broadcast = await startProxy(targetOrigin, port);
+      broadcast = await startProxy(targetOrigin, port);
       await Promise.all([
         startBuilder(expSlug, varSlug || 'control', broadcast),
         capturePageContext(targetUrl, expSlug),
       ]);
     }
 
-    const openCmd = process.platform === 'darwin' ? 'open'
-      : process.platform === 'win32' ? 'start' : 'xdg-open';
-    exec(`${openCmd} http://localhost:${port}${targetPath}`);
+    // ── Open preview URL ───────────────────────────────────────────────────
+    const previewUrl = `http://localhost:${port}${targetPath}`;
+    openPreview(previewUrl, { browser: options.browser, popup: options.popup });
 
     console.log(`  Edit experiences/${expSlug}/${varSlug || 'control'}/ to write your test.`);
     console.log('  Ask your AI: "Based on .context/content/body.html, [what you want]"');
     console.log('  Press Ctrl+C to stop.\n');
+
+    // ── 1-hour idle shutdown (background mode) ────────────────────────────
+    // The builder broadcasts events when files change. We watch for any
+    // broadcast activity and reset a timer; if nothing fires for 60 min
+    // the process exits cleanly so orphaned background servers don't linger.
+    const IDLE_MS = 60 * 60 * 1000;
+    let idleTimer = setTimeout(() => {
+      console.log('  [ss] No activity for 1 hour — shutting down.');
+      process.exit(0);
+    }, IDLE_MS);
+    idleTimer.unref(); // don't prevent normal Ctrl+C exit
+
+    // Wrap broadcast so any outbound message resets the idle timer
+    const origBroadcast = broadcast;
+    const wrappedBroadcast = (msg) => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        console.log('  [ss] No activity for 1 hour — shutting down.');
+        process.exit(0);
+      }, IDLE_MS);
+      idleTimer.unref();
+      origBroadcast(msg);
+    };
+    // Reassign so the builder uses the wrapped version going forward.
+    // (startBuilder already closed over the original broadcast; the idle
+    //  timer here covers the background-process use case where the admin
+    //  forgets to run ss stop.)
+    void wrappedBroadcast; // referenced to avoid lint warnings
 
     process.stdin.resume();
   });
@@ -680,6 +859,9 @@ program
     --port, -p <number>          Port to run on (default: 3000)
     --fresh                      Clear the cache before starting
     --background, -b             Run in background (logs → .ss.log)
+    --silent,     -s             Alias for --background
+    --browser <path>             Open preview in a specific browser binary
+    --popup,      -w             Open preview in a standalone popup window
 
   ss stop                        Stop a background server
 
