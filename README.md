@@ -50,6 +50,7 @@ ss start
 
 ```
 ss init [dirname]              Initialize a new project directory
+  --template, -t <name>        Use a platform template (vwo | gtm | at)
 
 ss new experience <name>       Create a new experience
 ss new variation <name>        Create a new variation for the active experience
@@ -66,6 +67,8 @@ ss list                        Show all experiences and variations
 ss capture [url]               Re-capture page context (screenshots + HTML)
 ss build                       Bundle all experiences to dist/ (minified)
 ss cache clear                 Delete all cached resources (.cache/)
+ss upgrade                     Upgrade ss to the latest version
+ss uninstall                   Remove the ss binary and installation directory
 ss man                         Show the full command reference
 ```
 
@@ -205,10 +208,50 @@ To unlink when done:
 npm unlink -g start-scripting
 ```
 
+## Platform templates
+
+`ss init --template <name>` runs a guided wizard tailored to your A/B platform:
+
+| Template | Platform | Default trigger |
+|----------|----------|-----------------|
+| `vwo` | Visual Website Optimizer | `VWO:DOM_READY` |
+| `gtm` | Google Tag Manager | `GTM:DOM_READY` |
+| `at` | Adobe Target | `AT:DOM_READY` |
+
+Each template asks only the questions relevant to that platform, sets the correct trigger on each block, and writes export notes to `config.json`.
+
+## Handlebars variables
+
+Define reusable values in the **General** tab of the project manager and reference them in any resource file with `{{variable_name}}`. Values are replaced at build time — before esbuild bundles the code.
+
+```js
+// modification.js
+document.querySelector('.hero h1').textContent = {{headline}};
+```
+
+```css
+/* modification.css */
+.hero { background: {{brand_color}}; }
+```
+
+Variables support typed values (`string`, `number`, `boolean`, `null`, `object`, `array`). Renaming a variable in the UI updates all token references in source files automatically.
+
 ## Updating
 
 ```bash
-cd ~/.ss && git pull && npm install
-# or
-cd ~/.ss && ./setup.sh
+ss upgrade
 ```
+
+Or manually:
+
+```bash
+cd ~/.ss && git pull && npm install
+```
+
+## Uninstalling
+
+```bash
+ss uninstall
+```
+
+Removes the global `ss` symlink and deletes the installation directory. Your project directories and `config.json` files are never touched.

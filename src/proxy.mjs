@@ -23,6 +23,7 @@ import {
 import {
   readFileSync,
   writeFileSync,
+  readdirSync,
   mkdirSync,
   existsSync,
   rmSync,
@@ -380,16 +381,111 @@ function isCacheable(contentType) {
 }
 
 /**
- * Write a response buffer to the cache, silently skipping on any error.
- * Only writes on a cache miss so we never overwrite a previously cached file.
+ * Write a response buffer to the cache.
+ * @param {string} urlPath
+ * @param {Buffer} buffer
+ * @param {string} domain
+ * @param {boolean} [force=false] - If false (default), skips if file already exists (miss-only).
+ *                                   If true, overwrites (used by background revalidation).
  */
-function writeToCache(urlPath, buffer, domain) {
+function writeToCache(urlPath, buffer, domain, force = false) {
   const cachePath = getCachePath(urlPath, domain);
-  if (!cachePath || existsSync(cachePath)) return;
+  if (!cachePath) return;
+  if (!force && existsSync(cachePath)) return;
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
     writeFileSync(cachePath, buffer);
   } catch (_) {}
+}
+
+// Tracks URLs currently being background-revalidated to avoid duplicate fetches.
+const _revalidating = new Set();
+
+// ─── Handlebars variable value parsing ────────────────────────────────────────
+
+const _VALID_VAR_TYPES = new Set(['string', 'number', 'boolean', 'null', 'object', 'array']);
+
+/**
+ * Parse a raw value (from a WS message) into the correct JS type for storage.
+ * Throws on invalid input.
+ *
+ * @param {string} type  - One of the _VALID_VAR_TYPES
+ * @param {*}      raw   - The raw value from the client (string from input, or pre-parsed)
+ * @returns {*} The correctly-typed value
+ */
+function parseVarValue(type, raw) {
+  switch (type) {
+    case 'string':  return String(raw ?? '');
+    case 'number': {
+      const n = Number(raw);
+      if (isNaN(n)) throw new Error('Not a valid number');
+      return n;
+    }
+    case 'boolean': return raw === true || raw === 'true';
+    case 'null':    return null;
+    case 'object':
+    case 'array': {
+      if (typeof raw === 'object') return raw;
+      try { return JSON.parse(raw); } catch { throw new Error('Invalid JSON for type ' + type); }
+    }
+    default: return String(raw ?? '');
+  }
+}
+
+// ─── Handlebars reference helpers ─────────────────────────────────────────────
+
+const _HB_SCAN_EXTS = new Set(['.js', '.ts', '.tsx', '.jsx', '.mjs', '.cjs', '.css', '.scss', '.sass', '.html']);
+
+/**
+ * Scan all source files under experiences/<expSlug>/ and count occurrences of
+ * each {{variable_name}} token. Returns { varName: count }.
+ */
+function countHandlebarsRefs(expSlug) {
+  const expDir = join(process.cwd(), 'experiences', expSlug);
+  const counts = {};
+  function walk(dir) {
+    let entries;
+    try { entries = readdirSync(dir); } catch { return; }
+    for (const f of entries) {
+      const full = join(dir, f);
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      if (st.isDirectory()) { walk(full); continue; }
+      if (!_HB_SCAN_EXTS.has(extname(f).toLowerCase())) continue;
+      let content;
+      try { content = readFileSync(full, 'utf8'); } catch { continue; }
+      for (const m of content.matchAll(/\{\{([^}]+)\}\}/g)) {
+        const name = m[1].trim();
+        counts[name] = (counts[name] || 0) + 1;
+      }
+    }
+  }
+  walk(expDir);
+  return counts;
+}
+
+/**
+ * Walk all source files under a directory and replace every occurrence of
+ * oldToken with newToken (plain string replacement, not regex).
+ */
+function walkAndReplace(dir, oldToken, newToken) {
+  function walk(d) {
+    let entries;
+    try { entries = readdirSync(d); } catch { return; }
+    for (const f of entries) {
+      const full = join(d, f);
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      if (st.isDirectory()) { walk(full); continue; }
+      if (!_HB_SCAN_EXTS.has(extname(f).toLowerCase())) continue;
+      try {
+        const content = readFileSync(full, 'utf8');
+        if (!content.includes(oldToken)) continue;
+        writeFileSync(full, content.split(oldToken).join(newToken));
+      } catch {}
+    }
+  }
+  walk(dir);
 }
 
 // ─── Log buffer ───────────────────────────────────────────────────────────────
@@ -883,6 +979,32 @@ function buildInjectSnippet(ssOrigin) {
           }
           .num-input:focus { outline: none; border-color: #7c7cff; }
           .num-unit { font-size: 11px; color: #555; }
+          /* Variables section */
+          .var-rows { border: 1px solid #2a2a3a; border-radius: 4px; overflow: hidden; margin-bottom: 4px; }
+          .var-header { display: grid; grid-template-columns: 1fr 76px 1fr 30px 52px; gap: 6px; padding: 4px 8px; background: #1e1e2e; color: #555; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+          .var-row { display: grid; grid-template-columns: 1fr 76px 1fr 30px 52px; gap: 6px; padding: 5px 8px; align-items: start; border-top: 1px solid #1e1e2e; }
+          .var-name-input, .var-value-input { background: #2d2d44; color: #fff; border: 1px solid #3a3a55; border-radius: 4px; padding: 3px 6px; font: 12px/1.4 ui-monospace, monospace; width: 100%; box-sizing: border-box; }
+          .var-name-input { color: #a78bfa; }
+          .var-name-input:focus, .var-value-input:focus { outline: none; border-color: #7c7cff; }
+          .var-name-input.err, .var-value-input.err, .var-textarea.err { border-color: #f44336; }
+          .var-type-sel { background: #1e1e2e; color: #7c7cff; border: 1px solid #3a3a55; border-radius: 4px; padding: 3px 4px; font: 11px/1.4 inherit; width: 100%; cursor: pointer; }
+          .var-type-sel:focus { outline: none; border-color: #7c7cff; }
+          .var-value-sel { background: #2d2d44; color: #fff; border: 1px solid #3a3a55; border-radius: 4px; padding: 3px 6px; font: 12px/1.4 inherit; width: 100%; }
+          .var-value-sel:focus { outline: none; border-color: #7c7cff; }
+          .var-null-val { color: #555; font-size: 11px; font-style: italic; padding-top: 4px; display: block; }
+          .var-textarea { background: #2d2d44; color: #fff; border: 1px solid #3a3a55; border-radius: 4px; padding: 3px 6px; font: 11px/1.4 ui-monospace, monospace; width: 100%; box-sizing: border-box; resize: vertical; min-height: 30px; max-height: 120px; }
+          .var-textarea:focus { outline: none; border-color: #7c7cff; }
+          .var-value-cell { min-width: 0; }
+          .var-refs { text-align: center; font-size: 11px; color: #555; padding-top: 4px; }
+          .var-actions { display: flex; gap: 2px; align-items: center; justify-content: flex-end; padding-top: 2px; }
+          .var-del-btn { background: none; border: none; color: #f44336; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; }
+          .var-del-btn:disabled { color: #3a2a2a; cursor: not-allowed; }
+          .var-del-btn:not(:disabled):hover { color: #ff6659; }
+          .var-save-btn { background: none; border: none; color: #4caf50; cursor: pointer; font-size: 17px; line-height: 1; padding: 0 3px; }
+          .var-save-btn:hover { color: #66bb6a; }
+          .var-cancel-btn { background: none; border: none; color: #777; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 3px; }
+          .var-cancel-btn:hover { color: #aaa; }
+          .var-err { grid-column: 1 / -1; font-size: 11px; color: #f44336; padding: 0 0 2px; }
         </style>
         <div class="overlay">
           <div class="modal" role="dialog" aria-modal="true" aria-label="ss Project Manager">
@@ -961,10 +1083,22 @@ function buildInjectSnippet(ssOrigin) {
       this._activeTab = name;
       this._root.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
       const pane = this._root.querySelector('.tab-pane');
-      if (name === 'general')   { pane.innerHTML = this._tabGeneral();   this._wireGeneral(); }
-      if (name === 'pages')     { pane.innerHTML = this._tabPages();     this._wirePages(); }
-      if (name === 'content')   { pane.innerHTML = this._tabContent();   this._wireContent(); }
-      if (name === 'developer') { pane.innerHTML = this._tabDeveloper(); this._wireDeveloper(); }
+      const tabFns = {
+        general:   [() => this._tabGeneral(),   () => this._wireGeneral()],
+        pages:     [() => this._tabPages(),     () => this._wirePages()],
+        content:   [() => this._tabContent(),   () => this._wireContent()],
+        developer: [() => this._tabDeveloper(), () => this._wireDeveloper()],
+      };
+      const fns = tabFns[name];
+      if (!fns) return;
+      try { pane.innerHTML = fns[0](); } catch (err) {
+        pane.innerHTML = '<div style="padding:16px;color:#f88;font-size:12px"><strong>[ss] Tab render error</strong><br>' + String(err) + '</div>';
+        console.error('[ss] Tab render error in ' + name + ':', err);
+        return;
+      }
+      try { fns[1](); } catch (err) {
+        console.error('[ss] Tab wire error in ' + name + ':', err);
+      }
     }
 
     // ── Tab: General ────────────────────────────────────────────────────────
@@ -1053,6 +1187,44 @@ function buildInjectSnippet(ssOrigin) {
             <div class="field-value">\${targetNote}</div>
           </div>
         </div>
+        \${(() => {
+          const vars = exp?.variables?.handlebars || {};
+          const varEntries = Object.entries(vars);
+          const typeOpts = ['string','number','boolean','null','object','array'];
+          const varRows = varEntries.map(([name, entry]) => {
+            const type = entry?.type || 'string';
+            const value = entry && typeof entry === 'object' && 'value' in entry ? entry.value : (entry ?? '');
+            const valueAttr = JSON.stringify(value).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            return \`
+            <div class="var-row" data-var-name="\${name}" data-var-type="\${type}" data-var-value="\${valueAttr}">
+              <input class="var-name-input" data-field="name" type="text" value="\${name}" spellcheck="false" />
+              <select class="var-type-sel" data-field="type">
+                \${typeOpts.map(t => \`<option value="\${t}"\${t===type?' selected':''}>\${t}</option>\`).join('')}
+              </select>
+              <div class="var-value-cell">\${this._varValueWidget(type, value)}</div>
+              <span class="var-refs" data-var="\${name}" title="References in code">—</span>
+              <div class="var-actions">
+                <button class="var-del-btn" data-var="\${name}" title="Delete variable" disabled>✕</button>
+                <button class="var-save-btn" style="display:none" title="Save changes">✓</button>
+                <button class="var-cancel-btn" style="display:none" title="Discard changes">✗</button>
+              </div>
+            </div>\`;
+          }).join('');
+          return \`
+          <div class="section" id="ss-variables-section">
+            <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
+              Variables (Handlebars)
+              <button class="btn btn-sm" id="ss-add-var-btn">+ Add</button>
+            </div>
+            <div style="color:#666;font-size:11px;margin-bottom:8px">
+              Use <span style="font-family:ui-monospace,monospace;background:#1e1e2e;padding:1px 5px;border-radius:3px;color:#a78bfa">{{name}}</span> in any resource file — replaced at build time.
+            </div>
+            <div class="var-rows" id="ss-var-rows">
+              <div class="var-header"><span>Name</span><span>Type</span><span>Value</span><span style="text-align:center">Refs</span><span></span></div>
+              \${varRows}
+            </div>
+          </div>\`;
+        })()}
       \`;
     }
 
@@ -1072,6 +1244,234 @@ function buildInjectSnippet(ssOrigin) {
         if (e.key === 'Enter') { e.preventDefault(); nameEl.blur(); }
         if (e.key === 'Escape') { nameEl.textContent = nameEl.dataset.orig; nameEl.blur(); }
       });
+
+      // ── Variables section ─────────────────────────────────────────────────
+      const varSection = pane.querySelector('#ss-variables-section');
+      const varRowsEl  = pane.querySelector('#ss-var-rows');
+      if (!varSection || !varRowsEl || !expSlug) return;
+
+      // Re-fetch data and re-render the General tab after any mutation.
+      const refreshGeneral = async () => {
+        const [cfg2, proj2] = await Promise.all([
+          fetch('${ssOrigin}/__ss__/config').then(r => r.json()),
+          fetch('${ssOrigin}/__ss__/project').then(r => r.json()),
+        ]);
+        this._data = { config: cfg2, project: proj2 };
+        this._showTab('general');
+      };
+
+      // Wire a single existing var-row: dirty tracking → save/cancel; delete.
+      const wireRow = (row) => {
+        const origName  = row.dataset.varName;
+        const origType  = row.dataset.varType;
+        // data-var-value stores JSON.stringify(value) — parse it back
+        let origValue;
+        try { origValue = JSON.parse(row.dataset.varValue); } catch { origValue = ''; }
+
+        const nameInp  = row.querySelector('[data-field="name"]');
+        const typeSel  = row.querySelector('[data-field="type"]');
+        const delBtn   = row.querySelector('.var-del-btn');
+        const saveBtn  = row.querySelector('.var-save-btn');
+        const cancelBtn = row.querySelector('.var-cancel-btn');
+
+        const setDirty = (dirty) => {
+          if (delBtn)    { delBtn.style.display    = dirty ? 'none' : ''; }
+          if (saveBtn)   { saveBtn.style.display   = dirty ? '' : 'none'; }
+          if (cancelBtn) { cancelBtn.style.display = dirty ? '' : 'none'; }
+        };
+
+        const isDirty = () => {
+          if (nameInp?.value.trim() !== origName) return true;
+          const ct = typeSel?.value;
+          if (ct !== origType) return true;
+          const vw = row.querySelector('[data-field="value"]');
+          if (ct === 'null' || !vw) return false;
+          if (ct === 'object' || ct === 'array') {
+            return vw.value.trim() !== JSON.stringify(origValue, null, 2);
+          }
+          if (ct === 'boolean') return (vw.value === 'true') !== Boolean(origValue);
+          return vw.value !== String(origValue ?? '');
+        };
+
+        const updateDirty = () => setDirty(isDirty());
+
+        const rewireValueWidget = () => {
+          const vw = row.querySelector('[data-field="value"]');
+          vw?.addEventListener('input', updateDirty);
+          vw?.addEventListener('change', updateDirty);
+        };
+
+        nameInp?.addEventListener('input', updateDirty);
+        typeSel?.addEventListener('change', () => {
+          const newType = typeSel.value;
+          const vc = row.querySelector('.var-value-cell');
+          if (vc) {
+            vc.innerHTML = this._varValueWidget(newType, this._defaultForType(newType));
+            rewireValueWidget();
+          }
+          updateDirty();
+        });
+        rewireValueWidget();
+
+        saveBtn?.addEventListener('click', async () => {
+          const newName = nameInp?.value.trim() || origName;
+          const newType = typeSel?.value || origType;
+          const vw = row.querySelector('[data-field="value"]');
+          const rawValue = vw?.tagName === 'SELECT' ? vw.value : (vw?.value ?? '');
+
+          if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(newName)) {
+            nameInp?.classList.add('err');
+            setTimeout(() => nameInp?.classList.remove('err'), 2000);
+            return;
+          }
+          // Rename first if name changed
+          if (newName !== origName) {
+            const r = await this._cmd({ action: 'rename-variable', expSlug, oldName: origName, newName });
+            if (!r?.ok) {
+              nameInp?.classList.add('err');
+              setTimeout(() => nameInp?.classList.remove('err'), 2000);
+              return;
+            }
+          }
+          // Update type+value
+          const r2 = await this._cmd({ action: 'update-variable-value', expSlug, name: newName, varType: newType, value: rawValue });
+          if (!r2?.ok) {
+            vw?.classList.add('err');
+            setTimeout(() => vw?.classList.remove('err'), 2000);
+            return;
+          }
+          await refreshGeneral();
+        });
+
+        cancelBtn?.addEventListener('click', () => {
+          if (nameInp) nameInp.value = origName;
+          if (typeSel) typeSel.value = origType;
+          const vc = row.querySelector('.var-value-cell');
+          if (vc) {
+            vc.innerHTML = this._varValueWidget(origType, origValue);
+            rewireValueWidget();
+          }
+          setDirty(false);
+        });
+
+        delBtn?.addEventListener('click', async () => {
+          if (delBtn.disabled) return;
+          const r = await this._cmd({ action: 'delete-variable', expSlug, name: origName });
+          if (r?.ok) await refreshGeneral();
+          else { delBtn.title = r?.error || 'Could not delete'; }
+        });
+      };
+
+      // Wire all existing rows.
+      varRowsEl.querySelectorAll('.var-row[data-var-name]').forEach(row => wireRow(row));
+
+      // Load reference counts and enable/disable delete buttons.
+      fetch('${ssOrigin}/__ss__/variable-refs?exp=' + expSlug)
+        .then(r => r.json())
+        .then(refs => {
+          varRowsEl.querySelectorAll('.var-refs[data-var]').forEach(el => {
+            el.textContent = refs[el.dataset.var] ?? 0;
+          });
+          varRowsEl.querySelectorAll('.var-del-btn[data-var]').forEach(btn => {
+            const count = refs[btn.dataset.var] ?? 0;
+            btn.disabled = count > 0;
+            btn.title = count > 0 ? \`\${count} reference(s) in code — remove them first\` : 'Delete variable';
+          });
+        }).catch(() => {});
+
+      // ── "+ Add" — inserts an inline new-variable row ──────────────────────
+      varSection.querySelector('#ss-add-var-btn')?.addEventListener('click', () => {
+        if (varRowsEl.querySelector('.var-row-new')) {
+          varRowsEl.querySelector('.var-row-new [data-field="name"]')?.focus();
+          return;
+        }
+        const typeOpts = ['string','number','boolean','null','object','array'];
+        const initType = 'string';
+        const newRow = document.createElement('div');
+        newRow.className = 'var-row var-row-new';
+        newRow.innerHTML = \`
+          <input class="var-name-input" data-field="name" type="text" placeholder="variable_name" spellcheck="false" />
+          <select class="var-type-sel" data-field="type">
+            \${typeOpts.map(t => \`<option value="\${t}"\${t===initType?' selected':''}>\${t}</option>\`).join('')}
+          </select>
+          <div class="var-value-cell">\${this._varValueWidget(initType, '')}</div>
+          <span></span>
+          <div class="var-actions">
+            <button class="var-save-btn" title="Save">✓</button>
+            <button class="var-cancel-btn" title="Cancel" style="color:#777">✕</button>
+          </div>
+        \`;
+        varRowsEl.appendChild(newRow);
+        newRow.querySelector('[data-field="name"]').focus();
+
+        // Type change → swap value widget
+        newRow.querySelector('[data-field="type"]')?.addEventListener('change', function() {
+          const vc = newRow.querySelector('.var-value-cell');
+          if (vc) vc.innerHTML = this._varValueWidget(this.value, this._defaultForType(this.value));
+        }.bind(this));
+
+        const getErrEl = () => {
+          let e = newRow.querySelector('.var-err');
+          if (!e) { e = document.createElement('div'); e.className = 'var-err'; e.style.cssText = 'grid-column:1/-1;font-size:11px;color:#f44336;padding-bottom:3px'; newRow.appendChild(e); }
+          return e;
+        };
+
+        const doSave = async () => {
+          const nameEl = newRow.querySelector('[data-field="name"]');
+          const typeEl = newRow.querySelector('[data-field="type"]');
+          const vw     = newRow.querySelector('[data-field="value"]');
+          const name   = nameEl?.value.trim() || '';
+          const type   = typeEl?.value || 'string';
+          const rawVal = vw?.tagName === 'SELECT' ? vw.value : (vw?.value ?? '');
+
+          if (!name) { nameEl?.classList.add('err'); nameEl?.focus(); return; }
+          if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+            nameEl.classList.add('err');
+            getErrEl().textContent = 'Name: letters, numbers, underscores; must start with letter or _';
+            nameEl.focus();
+            return;
+          }
+          const r = await this._cmd({ action: 'create-variable', expSlug, name, varType: type, value: rawVal });
+          if (r?.ok) { await refreshGeneral(); }
+          else { getErrEl().textContent = r?.error || 'Could not save variable'; }
+        };
+
+        newRow.querySelector('.var-save-btn')?.addEventListener('click', doSave);
+        newRow.querySelector('.var-cancel-btn')?.addEventListener('click', () => newRow.remove());
+        newRow.querySelectorAll('input, textarea').forEach(inp => {
+          inp.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && inp.tagName !== 'TEXTAREA') { e.preventDefault(); doSave(); }
+            if (e.key === 'Escape') newRow.remove();
+          });
+        });
+      });
+    }
+
+    // ── Helpers for variable value rendering ─────────────────────────────────
+    _varValueWidget(type, val) {
+      if (type === 'boolean') {
+        return '<select class="var-value-sel" data-field="value">' +
+          '<option' + (val === true || val === 'true' ? ' selected' : '') + '>true</option>' +
+          '<option' + (val === false || val === 'false' ? ' selected' : '') + '>false</option>' +
+          '</select>';
+      }
+      if (type === 'null') return '<span class="var-null-val">null</span>';
+      if (type === 'object' || type === 'array') {
+        const json = (typeof val === 'string' ? val : JSON.stringify(val, null, 2)) || '{}';
+        const safe = json.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        return '<textarea class="var-textarea" data-field="value" rows="2" spellcheck="false">' + safe + '</textarea>';
+      }
+      const v = String(val ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return '<input class="var-value-input" type="' + (type === 'number' ? 'number' : 'text') + '" data-field="value" value="' + v + '" spellcheck="false" />';
+    }
+
+    _defaultForType(type) {
+      if (type === 'number')  return 0;
+      if (type === 'boolean') return true;
+      if (type === 'null')    return null;
+      if (type === 'object')  return {};
+      if (type === 'array')   return [];
+      return '';
     }
 
     // ── Tab: Pages ──────────────────────────────────────────────────────────
@@ -1450,7 +1850,7 @@ function buildInjectSnippet(ssOrigin) {
           const mod = variation?.modifications?.find(m => m.slug === modSlug);
           if (!mod) return;
           const viewer = document.querySelector('ss-code-viewer');
-          if (viewer) viewer.open(mod, expSlug2, varSlug, variation?.modifications || []);
+          if (viewer) viewer.open(mod, expSlug2, varSlug, variation?.modifications || [], project._template);
         });
       });
 
@@ -1724,13 +2124,9 @@ function buildInjectSnippet(ssOrigin) {
               <span class="cv-mod-name"></span>
               <div class="cv-settings">
                 <span class="cv-label">Trigger</span>
-                <select class="cv-select cv-trigger-sel">
-                  <option value="IMMEDIATE">IMMEDIATE</option>
-                  <option value="DOM_READY">DOM_READY</option>
-                  <option value="ELEMENT_LOADED">ELEMENT_LOADED</option>
-                  <option value="AFTER_CODE_BLOCK">AFTER_CODE_BLOCK</option>
-                </select>
+                <select class="cv-select cv-trigger-sel"></select>
                 <input class="cv-input cv-selector-input" placeholder="CSS selector" style="display:none"/>
+                <input class="cv-input cv-event-input" placeholder="Event name" style="display:none"/>
                 <select class="cv-select cv-dependency-sel" style="display:none"></select>
                 <div class="cv-dirty-row">
                   <button class="cv-save-btn">Save</button>
@@ -1756,40 +2152,52 @@ function buildInjectSnippet(ssOrigin) {
       });
 
       // Track dirty state when trigger settings change
-      const trigSel  = this._root.querySelector('.cv-trigger-sel');
-      const selInput = this._root.querySelector('.cv-selector-input');
-      const depSel   = this._root.querySelector('.cv-dependency-sel');
-      const dirtyRow = this._root.querySelector('.cv-dirty-row');
-      const saveBtn  = this._root.querySelector('.cv-save-btn');
-      const cancelBtn= this._root.querySelector('.cv-cancel-btn');
+      const trigSel   = this._root.querySelector('.cv-trigger-sel');
+      const selInput  = this._root.querySelector('.cv-selector-input');
+      const evtInput  = this._root.querySelector('.cv-event-input');
+      const depSel    = this._root.querySelector('.cv-dependency-sel');
+      const dirtyRow  = this._root.querySelector('.cv-dirty-row');
+      const saveBtn   = this._root.querySelector('.cv-save-btn');
+      const cancelBtn = this._root.querySelector('.cv-cancel-btn');
 
       const updateExtras = () => {
-        selInput.style.display = trigSel.value === 'ELEMENT_LOADED'   ? '' : 'none';
-        depSel.style.display   = trigSel.value === 'AFTER_CODE_BLOCK' ? '' : 'none';
+        const t = trigSel.value;
+        // selector needed for ELEMENT_LOADED family
+        const needsSel = t === 'ELEMENT_LOADED' || t.endsWith(':ELEMENT_LOADED') || t === 'GTM:ELEMENT_VISIBILITY';
+        const needsDep = t === 'AFTER_CODE_BLOCK' || t === 'VWO:AFTER_CODE_BLOCK';
+        const needsEvt = ['GTM:CUSTOM_EVENT','GTM:FORM_SUBMIT','GTM:CLICK','GTM:SCROLL'].includes(t);
+        selInput.style.display = needsSel ? '' : 'none';
+        evtInput.style.display = needsEvt ? '' : 'none';
+        depSel.style.display   = needsDep ? '' : 'none';
       };
       const markDirty = () => { dirtyRow.classList.add('visible'); };
       trigSel.addEventListener('change', () => { updateExtras(); markDirty(); });
       selInput.addEventListener('input', markDirty);
+      evtInput.addEventListener('input', markDirty);
       depSel.addEventListener('change', markDirty);
 
       saveBtn.addEventListener('click', async () => {
         const flash = this._root.querySelector('.cv-save-flash');
+        const t = trigSel.value;
         const payload = {
           action: 'update-modification-trigger',
           expSlug: this._expSlug,
           varSlug: this._varSlug,
           modSlug: this._modData.slug,
-          trigger: trigSel.value,
+          trigger: t,
         };
-        if (trigSel.value === 'ELEMENT_LOADED')    payload.selector   = selInput.value.trim();
-        if (trigSel.value === 'AFTER_CODE_BLOCK')  payload.dependency = depSel.value;
+        if (selInput.style.display !== 'none') payload.selector   = selInput.value.trim();
+        if (evtInput.style.display !== 'none') payload.event      = evtInput.value.trim();
+        if (depSel.style.display   !== 'none') payload.dependency = depSel.value;
         const res = await this._cmd(payload);
         if (res.ok) {
           dirtyRow.classList.remove('visible');
           flash.style.display = '';
           setTimeout(() => { flash.style.display = 'none'; }, 1800);
-          this._modData.trigger    = trigSel.value;
-          this._modData.dependency = depSel.value;
+          this._modData.trigger    = t;
+          this._modData.selector   = payload.selector;
+          this._modData.event      = payload.event;
+          this._modData.dependency = payload.dependency;
         }
       });
 
@@ -1804,10 +2212,12 @@ function buildInjectSnippet(ssOrigin) {
       const allMods  = this._allMods || [];
       const trigSel  = this._root.querySelector('.cv-trigger-sel');
       const selInput = this._root.querySelector('.cv-selector-input');
+      const evtInput = this._root.querySelector('.cv-event-input');
       const depSel   = this._root.querySelector('.cv-dependency-sel');
 
       trigSel.value  = mod.trigger || 'DOM_READY';
       selInput.value = mod.selector || '';
+      evtInput.value = mod.event    || '';
 
       // Populate dependency dropdown with other blocks in the same variation
       const others = allMods.filter(m => m.slug !== mod.slug);
@@ -1820,8 +2230,13 @@ function buildInjectSnippet(ssOrigin) {
         depSel.value = mod.dependency;
       }
 
-      selInput.style.display = trigSel.value === 'ELEMENT_LOADED'   ? '' : 'none';
-      depSel.style.display   = trigSel.value === 'AFTER_CODE_BLOCK' ? '' : 'none';
+      const t = trigSel.value;
+      const needsSel = t === 'ELEMENT_LOADED' || t.endsWith(':ELEMENT_LOADED') || t === 'GTM:ELEMENT_VISIBILITY';
+      const needsDep = t === 'AFTER_CODE_BLOCK' || t === 'VWO:AFTER_CODE_BLOCK';
+      const needsEvt = ['GTM:CUSTOM_EVENT','GTM:FORM_SUBMIT','GTM:CLICK','GTM:SCROLL'].includes(t);
+      selInput.style.display = needsSel ? '' : 'none';
+      evtInput.style.display = needsEvt ? '' : 'none';
+      depSel.style.display   = needsDep ? '' : 'none';
     }
 
     _cmd(payload) {
@@ -1850,11 +2265,27 @@ function buildInjectSnippet(ssOrigin) {
       });
     }
 
-    open(modData, expSlug, varSlug, allMods) {
-      this._modData = modData;
-      this._expSlug = expSlug;
-      this._varSlug = varSlug;
-      this._allMods = allMods || [];
+    open(modData, expSlug, varSlug, allMods, template) {
+      this._modData  = modData;
+      this._expSlug  = expSlug;
+      this._varSlug  = varSlug;
+      this._allMods  = allMods || [];
+      this._template = template || null;
+
+      // Build trigger options based on template
+      const trigSel = this._root.querySelector('.cv-trigger-sel');
+      const GENERIC = ['IMMEDIATE','DOM_READY','ELEMENT_LOADED','AFTER_CODE_BLOCK'];
+      const VWO_TR  = ['VWO:IMMEDIATE','VWO:DOM_READY','VWO:ELEMENT_LOADED','VWO:AFTER_CODE_BLOCK'];
+      const GTM_TR  = ['GTM:INITIALIZATION','GTM:CONTAINER_LOADED','GTM:PAGE_VIEW','GTM:DOM_READY','GTM:WINDOW_LOADED','GTM:CUSTOM_EVENT','GTM:FORM_SUBMIT','GTM:CLICK','GTM:ELEMENT_VISIBILITY','GTM:SCROLL'];
+      const AT_TR   = ['AT:IMMEDIATE','AT:DOM_READY','AT:ELEMENT_LOADED'];
+      const tmpl = this._template;
+      const groups = tmpl === 'vwo' ? [['Generic', GENERIC], ['VWO', VWO_TR]]
+                   : tmpl === 'gtm' ? [['Generic', GENERIC], ['GTM', GTM_TR]]
+                   : tmpl === 'at'  ? [['Generic', GENERIC], ['Adobe Target', AT_TR]]
+                   : [['Generic', GENERIC], ['VWO', VWO_TR], ['GTM', GTM_TR], ['Adobe Target', AT_TR]];
+      trigSel.innerHTML = groups.map(([label, triggers]) =>
+        \`<optgroup label="\${label}">\${triggers.map(t => \`<option value="\${t}">\${t}</option>\`).join('')}</optgroup>\`
+      ).join('');
 
       this._root.querySelector('.cv-mod-name').textContent = modData.name || modData.slug;
       this._resetTriggerUi();
@@ -1945,18 +2376,18 @@ function buildInjectSnippet(ssOrigin) {
     }
   }
 
-  if (!customElements.get('ss-floating-menu')) {
-    customElements.define('ss-floating-menu', SsFloatingMenu);
-  }
-  if (!customElements.get('ss-modal')) {
-    customElements.define('ss-modal', SsModal);
-  }
-  if (!customElements.get('ss-code-viewer')) {
-    customElements.define('ss-code-viewer', SsCodeViewer);
-  }
-  document.body.appendChild(document.createElement('ss-floating-menu'));
-  document.body.appendChild(document.createElement('ss-modal'));
-  document.body.appendChild(document.createElement('ss-code-viewer'));
+  try {
+    if (!customElements.get('ss-floating-menu')) customElements.define('ss-floating-menu', SsFloatingMenu);
+    document.body.appendChild(document.createElement('ss-floating-menu'));
+  } catch (e) { console.error('[ss] Could not register ss-floating-menu:', e); }
+  try {
+    if (!customElements.get('ss-modal')) customElements.define('ss-modal', SsModal);
+    document.body.appendChild(document.createElement('ss-modal'));
+  } catch (e) { console.error('[ss] Could not register ss-modal:', e); }
+  try {
+    if (!customElements.get('ss-code-viewer')) customElements.define('ss-code-viewer', SsCodeViewer);
+    document.body.appendChild(document.createElement('ss-code-viewer'));
+  } catch (e) { console.error('[ss] Could not register ss-code-viewer:', e); }
 </script>`;
 }
 
@@ -2178,14 +2609,103 @@ async function handleCommand(msg, broadcast, reply) {
       const v = exp.variations?.find((v) => v.slug === msg.varSlug);
       const m = v?.modifications?.find((m) => m.slug === msg.modSlug);
       if (!m) return reply({ ok: false, error: 'Modification not found' });
-      const TRIGGERS = ['IMMEDIATE', 'DOM_READY', 'ELEMENT_LOADED', 'AFTER_CODE_BLOCK'];
-      if (!TRIGGERS.includes(msg.trigger)) return reply({ ok: false, error: 'Invalid trigger' });
+      // Import trigger helpers to validate and resolve the stored trigger value.
+      const { ALL_TRIGGERS, triggerExtras } = await import('./templates.mjs');
+      if (!ALL_TRIGGERS.includes(msg.trigger)) return reply({ ok: false, error: 'Invalid trigger' });
       m.trigger = msg.trigger;
-      if (msg.trigger === 'ELEMENT_LOADED')   { m.selector   = msg.selector   || ''; delete m.dependency; }
-      else if (msg.trigger === 'AFTER_CODE_BLOCK') { m.dependency = msg.dependency || ''; delete m.selector; }
-      else { delete m.selector; delete m.dependency; }
+      const extras = triggerExtras(msg.trigger);
+      if (extras === 'selector') {
+        m.selector = msg.selector || '';
+        if (msg.once !== undefined) m.once = msg.once !== false;
+        delete m.dependency;
+        delete m.event;
+      } else if (extras === 'dependency') {
+        m.dependency = msg.dependency || '';
+        delete m.selector;
+        delete m.event;
+      } else if (extras === 'event') {
+        m.event = msg.event || '';
+        delete m.selector;
+        delete m.dependency;
+      } else {
+        delete m.selector;
+        delete m.dependency;
+        delete m.event;
+      }
       saveConfig(config);
       writeCacheEntry(expSlug, msg.varSlug);
+      reply({ ok: true });
+      break;
+    }
+
+    case 'create-variable': {
+      if (!msg.name?.trim()) return reply({ ok: false, error: 'Name required' });
+      const vname = msg.name.trim();
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(vname)) return reply({ ok: false, error: 'Invalid variable name' });
+      const vtype = msg.varType || 'string';
+      if (!_VALID_VAR_TYPES.has(vtype)) return reply({ ok: false, error: 'Invalid variable type' });
+      let vvalue;
+      try { vvalue = parseVarValue(vtype, msg.value ?? ''); } catch (e) { return reply({ ok: false, error: e.message }); }
+      if (!exp.variables) exp.variables = {};
+      if (!exp.variables.handlebars) exp.variables.handlebars = {};
+      if (Object.prototype.hasOwnProperty.call(exp.variables.handlebars, vname)) {
+        return reply({ ok: false, error: 'Variable already exists' });
+      }
+      exp.variables.handlebars[vname] = { type: vtype, value: vvalue };
+      saveConfig(config);
+      reply({ ok: true });
+      break;
+    }
+
+    case 'update-variable-value': {
+      if (!exp.variables?.handlebars) return reply({ ok: false, error: 'No variables defined' });
+      if (!Object.prototype.hasOwnProperty.call(exp.variables.handlebars, msg.name)) {
+        return reply({ ok: false, error: 'Variable not found' });
+      }
+      const existing = exp.variables.handlebars[msg.name];
+      const uvtype = msg.varType || existing?.type || 'string';
+      if (!_VALID_VAR_TYPES.has(uvtype)) return reply({ ok: false, error: 'Invalid variable type' });
+      let uvvalue;
+      try { uvvalue = parseVarValue(uvtype, msg.value ?? ''); } catch (e) { return reply({ ok: false, error: e.message }); }
+      exp.variables.handlebars[msg.name] = { type: uvtype, value: uvvalue };
+      saveConfig(config);
+      broadcast({ type: 'reload' });
+      reply({ ok: true });
+      break;
+    }
+
+    case 'rename-variable': {
+      const hb = exp.variables?.handlebars;
+      if (!hb || !Object.prototype.hasOwnProperty.call(hb, msg.oldName)) {
+        return reply({ ok: false, error: 'Variable not found' });
+      }
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(msg.newName)) {
+        return reply({ ok: false, error: 'Invalid new variable name' });
+      }
+      if (Object.prototype.hasOwnProperty.call(hb, msg.newName)) {
+        return reply({ ok: false, error: 'A variable with that name already exists' });
+      }
+      hb[msg.newName] = hb[msg.oldName];
+      delete hb[msg.oldName];
+      saveConfig(config);
+      const expDirR = join(process.cwd(), 'experiences', expSlug);
+      walkAndReplace(expDirR, `{{${msg.oldName}}}`, `{{${msg.newName}}}`);
+      broadcast({ type: 'reload' });
+      reply({ ok: true });
+      break;
+    }
+
+    case 'delete-variable': {
+      const hb2 = exp.variables?.handlebars;
+      if (!hb2 || !Object.prototype.hasOwnProperty.call(hb2, msg.name)) {
+        return reply({ ok: false, error: 'Variable not found' });
+      }
+      const refs = countHandlebarsRefs(expSlug);
+      if ((refs[msg.name] || 0) > 0) {
+        return reply({ ok: false, error: `Cannot delete: ${refs[msg.name]} reference(s) in code` });
+      }
+      delete hb2[msg.name];
+      saveConfig(config);
       reply({ ok: true });
       break;
     }
@@ -2257,6 +2777,7 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
       experiences: config.experiences || [],
       editorUrl: exp?.pages?.editor || '',
       _settings: config.settings || {},
+      _template: config.settings?.template || null,
     });
   });
 
@@ -2360,12 +2881,35 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
     }
   });
 
-  // ── MIDDLEWARE: Local resource cache ─────────────────────────────────────
+  // ── ROUTE: Handlebars variable reference counts ───────────────────────────
+  app.get('/__ss__/variable-refs', (req, res) => {
+    const expSlug = req.query.exp;
+    if (!expSlug) return res.json({});
+    res.json(countHandlebarsRefs(expSlug));
+  });
+
+  // ── MIDDLEWARE: Local resource cache (stale-while-revalidate) ───────────
   app.use((req, res, next) => {
     if (req.method !== "GET") return next();
     const cachePath = getCachePath(req.path, targetDomain);
     if (!cachePath || !existsSync(cachePath)) return next();
 
+    const cfg = loadConfig();
+    const cacheTtl = cfg.settings?.cache_ttl ?? 3600;
+
+    // cache_ttl === 0 means bypass the cache entirely — always hit the network.
+    if (cacheTtl === 0) return next();
+
+    let ageMs = 0;
+    try {
+      ageMs = Date.now() - statSync(cachePath).mtimeMs;
+    } catch (_) {
+      return next(); // can't stat → fall through to proxy
+    }
+
+    const isStale = ageMs > cacheTtl * 1000;
+
+    // Serve the cached file immediately (fresh or stale).
     const ext = extname(req.path).toLowerCase();
     const contentType = CACHE_CONTENT_TYPES[ext];
     res.setHeader("Cache-Control", "public, max-age=3600");
@@ -2373,11 +2917,24 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
     if (ext === ".css") {
       const css = readFileSync(cachePath, "utf8").split(targetOrigin).join(localOrigin);
       res.setHeader("Content-Type", "text/css");
-      return res.send(css);
+      res.send(css);
+    } else {
+      res.setHeader("Content-Type", contentType);
+      res.send(readFileSync(cachePath));
     }
 
-    res.setHeader("Content-Type", contentType);
-    res.send(readFileSync(cachePath));
+    // If stale, kick off a background revalidation so the next request gets a
+    // fresh copy without the current caller having to wait.
+    if (isStale && !_revalidating.has(req.path)) {
+      _revalidating.add(req.path);
+      fetch(targetOrigin + req.path)
+        .then((r) => (r.ok ? r.arrayBuffer() : null))
+        .then((ab) => {
+          if (ab) writeToCache(req.path, Buffer.from(ab), targetDomain, true);
+        })
+        .catch(() => {})
+        .finally(() => _revalidating.delete(req.path));
+    }
   });
 
   if (pwFetcher) {
@@ -2502,13 +3059,46 @@ export async function startProxy(targetUrl, port = 3000, { pwFetcher = null } = 
     // The server 'error' handler above already calls process.exit for EADDRINUSE.
     wss.on('error', (_err) => {});
 
+    // ── Auto-shutdown: exit when all browser sessions close ─────────────────
+    // WS connections fall into two roles:
+    //   page clients  — the live-reload listener injected into every proxied page (never sends messages)
+    //   command sockets — ephemeral connections opened by <ss-modal> per command (sends action messages)
+    // We only track page clients for the shutdown heuristic.
+    let _hadPageClient = false;
+    let _shutdownTimer = null;
+
     // Handle inbound command messages from <ss-modal>.
     // Each message must have a unique { id } so the reply can be matched.
     wss.on('connection', (ws) => {
+      // Cancel any pending shutdown — a new connection just arrived.
+      if (_shutdownTimer) { clearTimeout(_shutdownTimer); _shutdownTimer = null; }
+
+      // Assume this is a page client until proven otherwise by a command message.
+      ws._isPageClient = true;
+
+      ws.on('close', () => {
+        if (ws._isPageClient) _hadPageClient = true;
+        // Only auto-shutdown after at least one real page has loaded.
+        if (!_hadPageClient) return;
+        const remaining = [...wss.clients].filter(c => c._isPageClient && c.readyState === 1 /* OPEN */);
+        if (remaining.length > 0) return;
+        // Grace period — covers normal page refreshes (old WS closes before new one opens).
+        _shutdownTimer = setTimeout(() => {
+          const still = [...wss.clients].filter(c => c._isPageClient && c.readyState === 1);
+          if (still.length === 0) {
+            console.log('\n  All browser sessions closed — shutting down.');
+            process.exit(0);
+          }
+        }, 8000);
+        if (_shutdownTimer.unref) _shutdownTimer.unref();
+      });
+
       ws.on('message', (raw) => {
         let msg;
         try { msg = JSON.parse(raw); } catch { return; }
         if (!msg?.action) return;
+        // This socket sent a command — it's a modal command socket, not a page client.
+        ws._isPageClient = false;
         const reply = (result) => {
           try { ws.send(JSON.stringify({ type: 'cmd-result', id: msg.id, ...result })); } catch (_) {}
         };

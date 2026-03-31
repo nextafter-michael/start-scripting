@@ -4,6 +4,7 @@
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
 import { join, extname } from 'path';
+import { runtimeTrigger, SELECTOR_TRIGGERS } from './templates.mjs';
 
 // File extensions treated as CSS-type (injected as <style> tags via esbuild plugins)
 const CSS_EXTS = new Set(['.css', '.scss', '.sass']);
@@ -70,13 +71,16 @@ export function writeCacheEntry(expSlug, varSlug) {
         // plain JS/TS files use a dynamic import() which esbuild bundles normally.
         const jsFile = (mod.resources || []).find(f => JS_EXTS.has(extname(f).toLowerCase()));
         if (jsFile) {
-          const trigger = mod.trigger || 'DOM_READY';
+          // Resolve namespaced triggers (VWO:DOM_READY, GTM:PAGE_VIEW, etc.) to
+          // their generic runtime equivalents for the client-side _trigger() call.
+          const storedTrigger  = mod.trigger || 'DOM_READY';
+          const trigger        = runtimeTrigger(storedTrigger);
           const isReact = JSX_EXTS.has(extname(jsFile).toLowerCase());
           const parts = [
             `slug: ${JSON.stringify(mod.slug)}`,
             `trigger: ${JSON.stringify(trigger)}`,
           ];
-          if (trigger === 'ELEMENT_LOADED') {
+          if (SELECTOR_TRIGGERS.has(storedTrigger) || trigger === 'ELEMENT_LOADED') {
             parts.push(`selector: ${JSON.stringify(mod.selector || '')}`);
             parts.push(`once: ${mod.once !== false}`);
           }

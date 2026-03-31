@@ -139,6 +139,115 @@ function syncExperiencesDir(expSlug) {
 }
 
 /**
+ * Extract the experience slug from a file path like .../experiences/<slug>/...
+ * Returns null if the path is not inside an experiences directory.
+ */
+function expSlugFromPath(filePath) {
+  const m = filePath.replace(/\\/g, '/').match(/\/experiences\/([^/]+)\//);
+  return m ? m[1] : null;
+}
+
+/**
+ * Read the handlebars variables for an experience from config.json.
+ * Returns a plain { varName: value } object, or {} if none defined.
+ */
+function getHandlebarsVars(expSlug) {
+  if (!expSlug) return {};
+  try {
+    const config = JSON.parse(readFileSync(join(process.cwd(), 'config.json'), 'utf8'));
+    const exp = config.experiences?.find(e => e.slug === expSlug);
+    return exp?.variables?.handlebars || {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Serialize a variable entry to a string for insertion into source code.
+ *
+ * @param {{ type: string, value: * }} entry - Variable descriptor from config.json
+ * @param {'js'|'css'|'html'} context        - File type being processed
+ * @returns {string}
+ */
+function serializeVar(entry, context) {
+  const { type, value } = entry;
+  if (context === 'js') {
+    if (type === 'null')    return 'null';
+    if (type === 'boolean') return String(Boolean(value));
+    if (type === 'number')  return String(Number(value));
+    if (type === 'string')  return JSON.stringify(String(value ?? ''));
+    // object / array
+    return JSON.stringify(value);
+  }
+  // CSS / HTML context
+  if (type === 'null')    return '';
+  if (type === 'boolean') return String(Boolean(value));
+  if (type === 'number')  return String(Number(value));
+  if (type === 'string')  return String(value ?? '');
+  // object / array — log a warning and cast to JSON string
+  console.warn(`[ss] Variable of type "${type}" used in CSS/HTML — casting to JSON string. Consider using a string variable instead.`);
+  return JSON.stringify(value);
+}
+
+/**
+ * Replace {{var_name}} tokens in a content string with serialized values.
+ * Unknown tokens are left unchanged.
+ *
+ * @param {string} content
+ * @param {{ [name: string]: { type: string, value: * } | string }} vars
+ *   - New format: { name: { type, value } }
+ *   - Legacy format (plain string values) is also accepted for migration.
+ * @param {'js'|'css'|'html'} [context='js']
+ */
+function applyHandlebars(content, vars, context = 'js') {
+  if (!vars || !Object.keys(vars).length) return content;
+  return content.replace(/\{\{([^}]+)\}\}/g, (match, key) => {
+    const trimmed = key.trim();
+    if (!Object.prototype.hasOwnProperty.call(vars, trimmed)) return match;
+    const entry = vars[trimmed];
+    // Support legacy plain-string values (migration path)
+    if (typeof entry !== 'object' || entry === null || !('type' in entry)) {
+      return context === 'js' ? JSON.stringify(String(entry)) : String(entry);
+    }
+    return serializeVar(entry, context);
+  });
+}
+
+/**
+ * esbuild plugin: handlebars variable substitution for JS/TS/JSX/TSX/MJS/CJS files.
+ *
+ * Only processes files inside the project's experiences/ directory.
+ * Infers the experience slug from the file path so it works for both
+ * single-experience dev builds and multi-experience production builds.
+ */
+function handlebarsPlugin() {
+  const expRoot = join(process.cwd(), 'experiences').replace(/\\/g, '/');
+  return {
+    name: 'handlebars',
+    setup(build) {
+      build.onLoad({ filter: /\.(js|ts|tsx|jsx|mjs|cjs)$/ }, async (args) => {
+        const normPath = args.path.replace(/\\/g, '/');
+        if (!normPath.startsWith(expRoot + '/')) return null; // not in experiences dir
+        const expSlug = expSlugFromPath(args.path);
+        if (!expSlug) return null;
+        const vars = getHandlebarsVars(expSlug);
+        if (!Object.keys(vars).length) return null; // nothing to replace — use default loader
+        const { readFile } = await import('fs/promises');
+        const content = await readFile(args.path, 'utf8');
+        const processed = applyHandlebars(content, vars, 'js');
+        const ext = args.path.split('.').pop().toLowerCase();
+        const loaderMap = { ts: 'ts', tsx: 'tsx', jsx: 'jsx', mjs: 'js', cjs: 'js', js: 'js' };
+        return {
+          contents: processed,
+          loader: loaderMap[ext] || 'js',
+          watchFiles: [args.path],
+        };
+      });
+    },
+  };
+}
+
+/**
  * esbuild plugin: style injector
  *
  * Converts any .css / .scss / .sass import into JavaScript that creates a
@@ -166,6 +275,9 @@ function cssInjectorPlugin() {
         } else {
           css = await readFile(args.path, 'utf8');
         }
+
+        const _expSlug = expSlugFromPath(args.path);
+        css = applyHandlebars(css, getHandlebarsVars(_expSlug), 'css');
 
         return {
           contents: `
@@ -203,7 +315,7 @@ function buildOptions(entryPoint, projectDir, outfile) {
       '.mjs': 'js',
       '.cjs': 'js',
     },
-    plugins: [cssInjectorPlugin()],
+    plugins: [handlebarsPlugin(), cssInjectorPlugin()],
   };
 }
 
@@ -239,9 +351,10 @@ function readCssFiles(expSlug, varSlug) {
           .map(f => {
             const filePath = join(blockDir, f);
             const ext = extname(f).toLowerCase();
+            const vars = getHandlebarsVars(expSlug);
             try {
-              if (ext === '.scss' || ext === '.sass') return getSass().compile(filePath).css;
-              return readFileSync(filePath, 'utf8');
+              if (ext === '.scss' || ext === '.sass') return applyHandlebars(getSass().compile(filePath).css, vars, 'css');
+              return applyHandlebars(readFileSync(filePath, 'utf8'), vars, 'css');
             } catch { return ''; }
           });
       })
@@ -271,7 +384,9 @@ function readVariationHtml(expSlug, varSlug) {
             try {
               const raw = readFileSync(join(blockDir, f), 'utf8');
               const stripped = raw.replace(/<!--[\s\S]*?-->/g, '').trim();
-              return stripped ? raw.trim() : '';
+              if (!stripped) return '';
+              const vars = getHandlebarsVars(expSlug);
+              return applyHandlebars(raw.trim(), vars, 'html');
             } catch { return ''; }
           });
       })
@@ -453,7 +568,7 @@ export async function buildAll() {
     bundle: true,
     format: 'iife',
     minify: true,
-    plugins: [cssInjectorPlugin()],
+    plugins: [handlebarsPlugin(), cssInjectorPlugin()],
   });
 
   console.log(`✔ Built ${experiences.length} experience(s) to dist/`);

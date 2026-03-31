@@ -10,6 +10,7 @@ CLI tool (`ss`) for A/B test development at a marketing agency. It starts a loca
 
 ```bash
 ss init [dirname]              # initialize a project (prompts for URL, experience, variation)
+  --template, -t <name>        # use a platform template: vwo, gtm, at
 ss new experience <name>       # create a new experience
 ss new variation <name>        # create a variation for the active experience
 ss new block <name>            # create a modification block for the active variation
@@ -19,6 +20,8 @@ ss list                        # list experiences/variations from config.json
 ss capture [url]               # re-capture page context to .context/
 ss cache clear                 # wipe .cache/
 ss build                       # bundle all experiences to dist/ (minified)
+ss upgrade                     # upgrade ss in the background
+ss uninstall                   # remove ss binary and installation directory
 ss man                         # full command reference
 ```
 
@@ -32,6 +35,8 @@ src/proxy.mjs       Express proxy server — mirrors live site, strips CSP, inje
 src/builder.mjs     esbuild watcher/bundler — outputs to dist/bundle.js
 src/scaffold.mjs    Creates experiences/variations/blocks, writes dist/entry/ cache files
 src/capture.mjs     Playwright page scan → screenshots + body.html in .context/
+src/templates.mjs   Trigger catalogue + platform-template init wizards (vwo, gtm, at)
+src/uninstaller.mjs Detached child script run by ss uninstall
 config.template.json  Reference schema for config.json
 dist/               Build output (gitignored)
   entry/            Synthetic esbuild entry files (one per experience, gitignored via dist/)
@@ -79,9 +84,14 @@ experiences/<exp-slug>/
         "resources": ["modification.css", "modification.js"]
       }]
     }],
-    "audiences": []
+    "audiences": [],
+    "variables": { "handlebars": { "headline": { "type": "string", "value": "Hello" } } }
   }],
-  "settings": { "cache_ttl": 3600, "timeout_ms": 30000, "spa": false, "ssr": false }
+  "settings": {
+    "cache_ttl": 3600, "timeout_ms": 30000, "spa": false, "ssr": false,
+    "template": "vwo",
+    "template_notes": ["Export note 1"]
+  }
 }
 ```
 
@@ -184,7 +194,39 @@ Module-level console interception in `proxy.mjs` captures all `log`/`warn`/`erro
 
 ### Resource caching
 
-`.cache/<domain>/` stores proxied static assets (CSS, JS, images, fonts) namespaced by the target hostname (e.g. `.cache/example.com/styles/main.css`). This supports multi-site projects without cross-domain cache collisions. The cache middleware runs before the proxy middleware — on a hit it serves from disk. CSS is URL-rewritten on serve so cached files remain valid after port changes. `writeToCache()` is miss-only (never overwrites).
+`.cache/<domain>/` stores proxied static assets (CSS, JS, images, fonts) namespaced by the target hostname (e.g. `.cache/example.com/styles/main.css`). This supports multi-site projects without cross-domain cache collisions. The cache middleware runs before the proxy middleware — on a hit it serves from disk. CSS is URL-rewritten on serve so cached files remain valid after port changes.
+
+**Stale-while-revalidate**: on a cache hit the asset is served immediately. If the file is older than `cache_ttl` seconds, a background `fetch()` overwrites the cache entry — the next request then gets the fresh copy. A `_revalidating` Set prevents duplicate in-flight fetches. `cache_ttl = 0` disables caching entirely (all requests pass through to origin).
+
+### Handlebars variable substitution
+
+`{{variable_name}}` tokens in resource files (JS/TS/JSX/TSX/MJS/CJS/CSS/SCSS/SASS/HTML) are replaced at build time with typed values from `config.json`.
+
+Variables are stored per-experience under `exp.variables.handlebars` as `{ type, value }` objects:
+- **Types**: `string`, `number`, `boolean`, `null`, `object`, `array`
+- **JS context**: bare literals — `true`, `42`, `"text"`, `null`, `{…}`
+- **CSS/HTML context**: raw strings; `object`/`array` cast to JSON string with a console warning
+
+`handlebarsPlugin()` in `src/builder.mjs` is an esbuild `onLoad` plugin that intercepts files in `experiences/`. `cssInjectorPlugin` and `readVariationHtml` apply the same substitution to CSS and HTML outside of esbuild.
+
+WS commands from the modal: `create-variable`, `update-variable-value`, `rename-variable` (renames the token across all source files), `delete-variable` (blocked when reference count > 0). Server route `GET /__ss__/variable-refs?exp=<slug>` returns per-variable counts.
+
+### Auto-shutdown
+
+The proxy self-terminates 8 seconds after all browser page-client WebSocket connections close (once at least one page session has been seen). Modal command sockets — identified by sending an `action` message — are excluded from the count. A pending shutdown is cancelled the moment any new connection arrives.
+
+### Platform templates
+
+`ss init --template <name>` (`vwo`, `gtm`, `at`) runs an interactive wizard that creates the experience/variation/block structure, writes the correct trigger defaults, and stores `settings.template` + `settings.template_notes` in `config.json`.
+
+`src/templates.mjs` exports:
+- `TRIGGER_GROUPS` — all 22 trigger strings grouped by platform
+- `ALL_TRIGGERS` — flat array for validation
+- `SELECTOR_TRIGGERS` — Set of triggers that require a `selector` field
+- `EVENT_TRIGGERS` — Set of GTM event triggers that require an `event` field
+- `triggerExtras(trigger)` — returns `{ needsSelector, needsDependency, needsEvent }` for UI
+- `runtimeTrigger(trigger)` — resolves namespaced triggers to generic runtime equivalents
+- `TEMPLATES` — `{ vwo, gtm, at }` each with `{ name, run }` used by `bin/ss.mjs`
 
 ### Filesystem sync
 
@@ -196,6 +238,10 @@ Module-level console interception in `proxy.mjs` captures all `log`/`warn`/`erro
 ### Bot protection
 
 `ss start` probes the target URL with a headless Playwright browser before starting the proxy. If Cloudflare (or similar) challenge text is detected, it switches to `PwFetcher` mode: a stealth browser (playwright-extra + puppeteer-extra-plugin-stealth) handles all HTML fetches; non-HTML assets are 302-redirected to the real domain.
+
+### `ss uninstall`
+
+`bin/ss.mjs` spawns `src/uninstaller.mjs` as a detached child process (same pattern as `ss upgrade`). The parent exits immediately; the child: waits 1.5 s for the parent to release file locks, runs `npm unlink` (fallback `npm rm -g start-scripting`), then `rmSync(toolDir, { recursive: true, force: true })`. Project directories are never touched.
 
 ## Key dependencies
 

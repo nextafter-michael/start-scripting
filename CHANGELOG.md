@@ -1,5 +1,86 @@
 # Changelog
 
+## 1.2.0
+
+### Stale-while-revalidate caching
+
+- **Serve cached assets immediately** — on a cache hit the response is served from disk right away; a background `fetch()` then overwrites the cached file so the next request gets the freshest version
+- **`cache_ttl = 0` bypasses cache entirely** — existing behaviour for `cache_ttl = 0` is preserved; all other values trigger the SWR strategy
+- A `_revalidating` Set prevents duplicate in-flight background fetches for the same URL
+- `writeToCache()` gains a `force` parameter (default `false`); background revalidation passes `force: true` to overwrite
+
+### Handlebars variable substitution
+
+- **`{{variable_name}}` tokens in resource files are replaced at build time** — works in `.js`, `.ts`, `.tsx`, `.jsx`, `.mjs`, `.cjs`, `.css`, `.scss`, `.sass`, and `.html` files
+- Variables are stored per-experience in `config.json` under `exp.variables.handlebars`
+- Each variable has a **type**: `string`, `number`, `boolean`, `null`, `object`, or `array`
+  - JS context: values are emitted as bare literals (`true`, `42`, `"text"`, `null`, `{…}`)
+  - CSS/HTML context: values are emitted as raw strings; `object`/`array` are JSON-stringified with a console warning
+  - Legacy plain-string values in config are accepted for backwards compatibility
+- **esbuild plugin** (`handlebarsPlugin`) intercepts all JS/TS/JSX/TSX/MJS/CJS files in `experiences/` and applies substitution before bundling
+- `cssInjectorPlugin` and `readCssFiles` apply substitution in CSS/SCSS context; `readVariationHtml` applies it in HTML context
+
+### Variables UI (General tab)
+
+- Variables section added to the **General tab** of `<ss-modal>` with a 5-column table: Name | Type | Value | Refs | Actions
+- **Inline editing** — click any row to edit name, type, or value in-place; ✓ Save / ✗ Cancel buttons appear only when a field is dirty
+- **Type-specific value widgets**: text input (string), number input (number), `<select>` (boolean, null), `<textarea>` (object, array)
+- **Reference count** — shows how many `{{token}}` occurrences exist in source files; variables with references cannot be deleted
+- **Inline "+ Add variable"** row — no browser `prompt()` calls; everything happens within the modal
+- WS commands: `create-variable`, `update-variable-value`, `rename-variable` (renames token across all source files), `delete-variable` (blocked when refs > 0)
+- Server route `GET /__ss__/variable-refs?exp=<slug>` returns per-variable reference counts
+
+### Auto-shutdown
+
+- The proxy server **self-terminates 8 seconds after all browser page-client WebSocket connections close**, provided at least one page has loaded during the session
+- Modal command sockets (which send `action` messages) are excluded from the page-client count so closing the project manager does not trigger shutdown
+- A pending shutdown is cancelled immediately when a new connection arrives (covers page refreshes)
+
+### Platform templates (`ss init --template`)
+
+- **`ss init --template vwo`** — VWO wizard: asks for URL, experience name, number of variations + names; creates one "Custom Code" block per variation with `VWO:DOM_READY`; writes `settings.template = "vwo"` and export notes to config
+- **`ss init --template gtm`** — GTM wizard: asks for URL, tag name, workspace name; single variation; CSS + JS block with `GTM:DOM_READY`; export notes include `<script type="text/gtmscript">` wrapping
+- **`ss init --template at`** — Adobe Target wizard: asks for URL, activity name, variation name; CSS + JS + HTML block with `AT:DOM_READY`; export notes warn about template-literal syntax
+- `src/templates.mjs` — new file; centralises trigger catalogue, `runtimeTrigger()` mapping, `SELECTOR_TRIGGERS`, `EVENT_TRIGGERS`, `triggerExtras()`, and wizard runners
+
+### Trigger namespaces
+
+- **22 trigger strings** now recognised across all templates: 4 generic, 4 VWO-namespaced, 10 GTM-specific, 3 AT-namespaced
+- `writeCacheEntry` in `scaffold.mjs` resolves stored trigger strings to generic runtime equivalents via `runtimeTrigger()` so the client-side `_trigger()` runtime always receives a known trigger type
+- `SELECTOR_TRIGGERS` set covers `ELEMENT_LOADED`, `VWO:ELEMENT_LOADED`, `AT:ELEMENT_LOADED`, and `GTM:ELEMENT_VISIBILITY`
+- `EVENT_TRIGGERS` set covers `GTM:CUSTOM_EVENT`, `GTM:FORM_SUBMIT`, `GTM:CLICK`, `GTM:SCROLL`
+- Code-viewer trigger `<select>` in `<ss-modal>` is populated per-template with `<optgroup>` sections
+
+### `ss uninstall`
+
+- **New command** — prompts for `"yes"` confirmation, then detaches a worker process (`src/uninstaller.mjs`) that: removes the global `ss` symlink (`npm unlink`, fallback `npm rm -g start-scripting`) and recursively deletes the installation directory
+- Project directories and their `config.json` files are never touched
+- Logs written to `.ss-uninstall.log` in the installation directory
+
+### `config.template.json` schema updates
+
+- `trigger` enum expanded from 4 to 22 values
+- `event` field added to modification block (GTM event name for GTM event triggers)
+- `settings.template` added (`"vwo" | "gtm" | "at" | null`)
+- `settings.template_notes` added (array of strings — export notes written by wizard)
+
+### `ss man` updates
+
+- TEMPLATES section documents `--template vwo/gtm/at` options with export notes
+- TRIGGERS section lists all 22 trigger strings with descriptions
+- COMMANDS table now includes `ss upgrade` and `ss uninstall`
+- UNINSTALL section added
+
+### Bug fixes
+
+- Syntax error in injected `<script>` (missing closing quote in template literal ternary) that caused the floating menu and modal to fail silently — fixed; `_showTab()` now wrapped in try/catch so render errors show an inline message instead of breaking the whole UI
+- Custom element registrations each independently try/catch'd so a broken tab cannot kill the floating menu
+- `create-variable` was silently dropped because `prompt()` is blocked inside a closed shadow DOM — removed all `prompt()`/`alert()` calls from the modal
+- Variable creation showed stale data after success — `refreshGeneral()` now re-fetches both `/config` and `/project` before re-rendering
+- `SEL_TRIGS` alias imported but never referenced — removed
+
+---
+
 ## 1.1.0
 
 Complete redesign of the project model and developer experience, building on the original `ss connect` proof-of-concept.

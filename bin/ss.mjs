@@ -276,7 +276,8 @@ program
 program
   .command('init [dirname]')
   .description('Initialize a new ss project in the current directory, or in a new subdirectory')
-  .action(async (dirname) => {
+  .option('-t, --template <name>', 'Use a platform template: vwo, gtm, at')
+  .action(async (dirname, opts) => {
     const projectDir = dirname ? resolve(process.cwd(), dirname) : process.cwd();
 
     if (dirname) {
@@ -352,7 +353,37 @@ program
       console.log('✔ Created AGENTS.md');
     }
 
-    // Prompts: URL → experience name → variation name
+    const { slugify, writeCacheEntry } = await import('../src/scaffold.mjs');
+    const templateName = opts?.template?.toLowerCase();
+
+    // ── Template wizard ───────────────────────────────────────────────────────
+    if (templateName) {
+      const { TEMPLATES } = await import('../src/templates.mjs');
+      const tmpl = TEMPLATES[templateName];
+      if (!tmpl) {
+        console.error(`✖ Unknown template "${templateName}". Available: ${Object.keys(TEMPLATES).join(', ')}`);
+        process.exit(1);
+      }
+      console.log(`\n  Using template: ${tmpl.name}`);
+      const helpers = { slugify, writeCacheEntry, writeFileSync, mkdirSync, join, existsSync };
+      const { config, expSlug, expName, varSlugs } = await tmpl.run(projectDir, prompt, helpers);
+
+      writeFileSync(join(projectDir, 'config.json'), JSON.stringify(config, null, 2));
+      console.log('✔ Created config.json');
+      console.log(`\n  ✔ Experience: ${expName} (${expSlug})`);
+      for (const { name, slug } of varSlugs) {
+        console.log(`  ✔ Variation:  ${name} (${slug})`);
+      }
+      const label = dirname ? `${dirname}/` : 'current directory';
+      console.log(`\n  Project initialized in ${label}`);
+      console.log('\n  Next steps:');
+      if (dirname) console.log(`    cd ${dirname}`);
+      console.log('    ss start                   Start the proxy and open the site');
+      console.log('');
+      return;
+    }
+
+    // ── Default (no template) wizard ──────────────────────────────────────────
     console.log('');
     const siteUrl = await prompt('  Site URL (press Enter to skip):         ');
     const expName = await prompt('  Experience name (press Enter to skip):  ');
@@ -360,8 +391,6 @@ program
     if (expName) {
       varName = await prompt('  Variation name (press Enter to skip):   ');
     }
-
-    const { slugify, writeCacheEntry } = await import('../src/scaffold.mjs');
 
     let config = {
       $schema: 'https://nextafter.com/ss/config-schema.json',
@@ -814,6 +843,42 @@ program
     console.log('  The upgrade will print "Upgrade completed: vX.Y.Z" when done.');
   });
 
+// ─── ss uninstall ─────────────────────────────────────────────────────────────
+
+program
+  .command('uninstall')
+  .description('Remove the ss binary and delete the installation directory')
+  .action(async () => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise(resolve =>
+      rl.question('  This will delete the ss installation directory. Type "yes" to confirm: ', resolve)
+    );
+    rl.close();
+
+    if (answer.trim().toLowerCase() !== 'yes') {
+      console.log('  Uninstall cancelled.');
+      return;
+    }
+
+    const toolDir = join(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), '..', '..');
+    const uninstallerPath = join(toolDir, 'src', 'uninstaller.mjs');
+    const logPath         = join(toolDir, '.ss-uninstall.log');
+
+    const logFd = openSync(logPath, 'w');
+    const child = spawn(process.execPath, [uninstallerPath, toolDir], {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+    });
+
+    child.unref();
+    closeSync(logFd);
+
+    console.log('\n  Uninstalling ss...');
+    console.log(`  Logs: ${logPath}`);
+    console.log('  Your project directories and config.json files are untouched.');
+    process.exit(0);
+  });
+
 // ─── ss man ───────────────────────────────────────────────────────────────────
 
 program
@@ -845,11 +910,12 @@ program
        Paste the output into modification.js / modification.css.
 
   5. ss build  →  dist/<exp-slug>.js
-       Paste into Optimizely / VWO / Convert to go live.
+       Paste into VWO / GTM / Adobe Target / Optimizely to go live.
 
   COMMANDS
   ────────
   ss init [dirname]              Initialize a new project directory
+    --template, -t <name>        Use a platform template (vwo | gtm | at)
 
   ss new experience <name>       Create a new experience
   ss new variation <name>        Create a new variation for the active experience
@@ -869,6 +935,8 @@ program
   ss capture [url]               Re-capture page context (screenshots + HTML)
   ss build                       Bundle all experiences to dist/ (minified)
   ss cache clear                 Delete all cached resources (.cache/)
+  ss upgrade                     Upgrade ss to the latest version
+  ss uninstall                   Remove the ss binary and installation directory
   ss man                         Show this reference
 
   EXPERIENCE FOLDER
@@ -890,6 +958,46 @@ program
     content/
       body.html    ← reference this file when prompting your AI assistant
 
+  TEMPLATES
+  ─────────
+  ss init --template vwo
+    VWO (Visual Website Optimizer). Wizard asks for URL, number of variations,
+    and a name for each. Creates one "Custom Code" block per variation with
+    trigger VWO:DOM_READY and resource order CSS → JS → HTML.
+
+  ss init --template gtm
+    Google Tag Manager. Single variation named after a GTM workspace. Block
+    uses GTM:DOM_READY by default. GTM-specific triggers are available in the
+    code-viewer: GTM:INITIALIZATION, GTM:CONTAINER_LOADED, GTM:PAGE_VIEW,
+    GTM:DOM_READY, GTM:WINDOW_LOADED, GTM:CUSTOM_EVENT, GTM:FORM_SUBMIT,
+    GTM:CLICK, GTM:ELEMENT_VISIBILITY, GTM:SCROLL.
+    Export note: JS → <script type="text/gtmscript">, CSS → <style>.
+
+  ss init --template at
+    Adobe Target. Single experience variation. Uses AT:DOM_READY by default.
+    Export note: JS → <script type="text/javascript">, CSS → <style>.
+    Template-literal interpolation (\${…}) is replaced with concatenation on
+    export (Adobe Target does not support template literal variables).
+
+  TRIGGERS
+  ────────
+  Generic (all templates):
+    IMMEDIATE         Run immediately when the bundle executes
+    DOM_READY         Run after DOMContentLoaded
+    ELEMENT_LOADED    Run when a CSS selector appears in the DOM
+    AFTER_CODE_BLOCK  Run after another named block's promise resolves
+
+  VWO-namespaced (behave identically to their generic counterparts):
+    VWO:IMMEDIATE  VWO:DOM_READY  VWO:ELEMENT_LOADED  VWO:AFTER_CODE_BLOCK
+
+  GTM-specific (previewed as DOM_READY; set on GTM tag after export):
+    GTM:INITIALIZATION  GTM:CONTAINER_LOADED  GTM:PAGE_VIEW  GTM:DOM_READY
+    GTM:WINDOW_LOADED   GTM:CUSTOM_EVENT      GTM:FORM_SUBMIT
+    GTM:CLICK           GTM:ELEMENT_VISIBILITY  GTM:SCROLL
+
+  Adobe Target-namespaced:
+    AT:IMMEDIATE  AT:DOM_READY  AT:ELEMENT_LOADED
+
   WINDOW VARIABLE (available on every proxied page)
   ─────────────────────────────────────────────────
   window.__ss = {
@@ -905,7 +1013,17 @@ program
 
   UPDATE
   ──────
-  cd ~/.ss && git pull && npm install
+  ss upgrade
+    Downloads the latest version in the background. Logs to .ss-upgrade.log
+    in the installation directory.
+
+  UNINSTALL
+  ─────────
+  ss uninstall
+    Prompts for confirmation, then removes the global "ss" symlink and
+    deletes the installation directory. Your project directories and their
+    config.json files are never touched. To reinstall, clone the repo and
+    run npm link again.
 `);
   });
 

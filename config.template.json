@@ -109,22 +109,33 @@
                         "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
                       },
                       "trigger": {
-                        "description": "When the block's JS should execute relative to page lifecycle.",
+                        "description": "When the block's JS should execute. Generic triggers work in any template; namespaced triggers (VWO:*, GTM:*, AT:*) are template-specific and resolved to their generic equivalents at preview time.",
                         "type": "string",
-                        "enum": ["IMMEDIATE", "DOM_READY", "ELEMENT_LOADED", "AFTER_CODE_BLOCK"],
+                        "enum": [
+                          "IMMEDIATE", "DOM_READY", "ELEMENT_LOADED", "AFTER_CODE_BLOCK",
+                          "VWO:IMMEDIATE", "VWO:DOM_READY", "VWO:ELEMENT_LOADED", "VWO:AFTER_CODE_BLOCK",
+                          "GTM:INITIALIZATION", "GTM:CONTAINER_LOADED", "GTM:PAGE_VIEW",
+                          "GTM:DOM_READY", "GTM:WINDOW_LOADED", "GTM:CUSTOM_EVENT",
+                          "GTM:FORM_SUBMIT", "GTM:CLICK", "GTM:ELEMENT_VISIBILITY", "GTM:SCROLL",
+                          "AT:IMMEDIATE", "AT:DOM_READY", "AT:ELEMENT_LOADED"
+                        ],
                         "default": "DOM_READY"
                       },
                       "selector": {
-                        "description": "CSS selector to wait for (ELEMENT_LOADED only). The block fires when a matching element is added to the DOM.",
+                        "description": "CSS selector to wait for (ELEMENT_LOADED / VWO:ELEMENT_LOADED / AT:ELEMENT_LOADED / GTM:ELEMENT_VISIBILITY). The block fires when a matching element is added to the DOM.",
+                        "type": "string"
+                      },
+                      "event": {
+                        "description": "GTM event name (GTM:CUSTOM_EVENT, GTM:FORM_SUBMIT, GTM:CLICK, GTM:SCROLL only).",
                         "type": "string"
                       },
                       "once": {
-                        "description": "For ELEMENT_LOADED: fire only the first time the selector matches (true) or every time a new match is added (false). Defaults to true.",
+                        "description": "For ELEMENT_LOADED family: fire only the first time the selector matches (true) or every time a new match is added (false). Defaults to true.",
                         "type": "boolean",
                         "default": true
                       },
                       "dependency": {
-                        "description": "Slug of another block in the same variation that must run first (AFTER_CODE_BLOCK only).",
+                        "description": "Slug of another block in the same variation that must run first (AFTER_CODE_BLOCK / VWO:AFTER_CODE_BLOCK only).",
                         "type": "string"
                       },
                       "hide_elements_until_code_runs": {
@@ -155,6 +166,24 @@
             "description": "Targeting audience definitions (reserved for future use).",
             "type": "array",
             "items": { "type": "object" }
+          },
+
+          "variables": {
+            "description": "Template variable definitions for this experience. Handlebars tokens ({{name}}) in resource files are replaced at build time.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "handlebars": {
+                "description": "Key-value pairs for {{variable}} substitution in JS/TS/CSS/HTML resource files. Keys are variable names, values are the replacement strings.",
+                "type": "object",
+                "additionalProperties": { "type": "string" }
+              },
+              "twig": {
+                "description": "Reserved for future Twig template variable support.",
+                "type": "object",
+                "additionalProperties": { "type": "string" }
+              }
+            }
           }
 
         }
@@ -198,6 +227,16 @@
           "description": "Load Font Awesome 6 Free (CSS) from CDN into every proxied page if it is not already present.",
           "type": "boolean",
           "default": false
+        },
+        "template": {
+          "description": "Platform template used when this project was initialised (vwo, gtm, at). Null means the default generic template.",
+          "type": ["string", "null"],
+          "enum": ["vwo", "gtm", "at", null]
+        },
+        "template_notes": {
+          "description": "Export and integration notes written by the template wizard. Read-only reference for developers and AI assistants.",
+          "type": "array",
+          "items": { "type": "string" }
         }
       }
     }
