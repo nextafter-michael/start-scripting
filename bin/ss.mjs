@@ -376,6 +376,7 @@ program
       }
       const label = dirname ? `${dirname}/` : 'current directory';
       console.log(`\n  Project initialized in ${label}`);
+      await _tryRegisterWithProxyService(projectDir);
       console.log('\n  Next steps:');
       if (dirname) console.log(`    cd ${dirname}`);
       console.log('    ss start                   Start the proxy and open the site');
@@ -438,14 +439,54 @@ program
       if (varSlug) console.log(`  ✔ Variation:  ${varName} (${varSlug})`);
     }
 
+    await _tryRegisterWithProxyService(projectDir);
+
+    // Check if ss-proxy-service is installed to tailor the "next steps" hint
+    const { join: pj2 } = await import('path');
+    const { homedir: hd2 } = await import('os');
+    const { existsSync: pe2 } = await import('fs');
+    const serviceInstalled = pe2(pj2(hd2(), '.ss-proxy', 'config.json'));
+
     const label = dirname ? `${dirname}/` : 'current directory';
     console.log(`\n  Project initialized in ${label}`);
     console.log('\n  Next steps:');
     if (dirname) console.log(`    cd ${dirname}`);
     if (!expName) console.log('    ss new experience <name>   Create your first experience');
-    console.log('    ss start                   Start the proxy and open the site');
+    if (serviceInstalled) {
+      console.log('    Open any matching page in your browser to see the injection.');
+      console.log('    (ss-proxy-service is running — no need to start a local server)');
+    } else {
+      console.log('    ss start                   Start the proxy and open the site');
+    }
     console.log('');
   });
+
+// ─── ss-proxy-service auto-register helper ───────────────────────────────────
+//
+// Called at the end of `ss init` (both template and default paths).
+// If ss-proxy-service is installed (~/.ss-proxy/config.json exists), the new
+// project directory is registered with it automatically so the always-on proxy
+// can immediately start injecting into matching pages.
+
+async function _tryRegisterWithProxyService(projectDir) {
+  const { join: pj } = await import('path');
+  const { homedir }  = await import('os');
+  const { existsSync: pe } = await import('fs');
+
+  const serviceConfig = pj(homedir(), '.ss-proxy', 'config.json');
+  if (!pe(serviceConfig)) return; // service not installed
+
+  try {
+    const { register } = await import('../src/service/db.mjs');
+    const { created }  = register(projectDir);
+    if (created) {
+      console.log('  ✔ Registered with ss-proxy-service.');
+      console.log('    The always-on proxy will inject this project automatically.');
+    }
+  } catch {
+    // Non-fatal — ss init should still succeed even if registration fails
+  }
+}
 
 // ─── ss new ───────────────────────────────────────────────────────────────────
 
@@ -849,23 +890,42 @@ program
   .command('uninstall')
   .description('Remove the ss binary and delete the installation directory')
   .action(async () => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const answer = await new Promise(resolve =>
-      rl.question('  This will delete the ss installation directory. Type "yes" to confirm: ', resolve)
-    );
-    rl.close();
+    const ask = (q) => {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      return new Promise(res => rl.question(q, a => { rl.close(); res(a.trim().toLowerCase()); }));
+    };
 
-    if (answer.trim().toLowerCase() !== 'yes') {
-      console.log('  Uninstall cancelled.');
-      return;
+    const confirm = await ask('  This will delete the ss installation directory. Type "yes" to confirm: ');
+    if (confirm !== 'yes') { console.log('  Uninstall cancelled.'); return; }
+
+    // Ask about the project registry DB (~/.ss-proxy/projects.db) if it exists
+    const { join: pjoin } = await import('path');
+    const { homedir } = await import('os');
+    const { existsSync: pExists } = await import('fs');
+    const dbPath = pjoin(homedir(), '.ss-proxy', 'projects.db');
+
+    let keepDb = false;
+    if (pExists(dbPath)) {
+      console.log('\n  A project registry database was found at:');
+      console.log(`    ${dbPath}`);
+      console.log('  If you keep it, re-installing ss will automatically remember all');
+      console.log('  your registered projects without needing to run ss init again.');
+      console.log('  If you remove it, you will need to run ss init in each project');
+      console.log('  directory after reinstalling to reconnect them.\n');
+      const dbAnswer = await ask('  Keep the project registry for a future reinstall? (yes/no): ');
+      keepDb = dbAnswer === 'yes' || dbAnswer === 'y';
+      console.log(keepDb ? '  ✔ Registry will be kept.' : '  Registry will be removed with the proxy service data.');
     }
 
     const toolDir = join(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), '..', '..');
     const uninstallerPath = join(toolDir, 'src', 'uninstaller.mjs');
     const logPath         = join(toolDir, '.ss-uninstall.log');
 
+    const args = [uninstallerPath, toolDir];
+    if (keepDb) args.push('--keep-db');
+
     const logFd = openSync(logPath, 'w');
-    const child = spawn(process.execPath, [uninstallerPath, toolDir], {
+    const child = spawn(process.execPath, args, {
       detached: true,
       stdio: ['ignore', logFd, logFd],
     });

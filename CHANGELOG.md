@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.3.0 (WIP — `experimental/ss-proxy-server`)
+
+### `ss-proxy-service` — always-on system proxy daemon
+
+A new companion binary that replaces the per-project `ss start` workflow. Instead of mirroring a site at `localhost:3000`, it intercepts all browser traffic at the OS level so the address bar always shows the real URL. Multiple projects across multiple domains are active simultaneously.
+
+#### Architecture (`src/service/`)
+
+| Module | Purpose |
+|---|---|
+| `cert.mjs` | Local CA generation (4096-bit RSA, 10yr) + per-domain leaf cert cache (2048-bit, 1yr, regenerated after 11 months) using `node-forge` |
+| `db.mjs` | JSON-file project registry at `~/.ss-proxy/projects.json` — `register`, `unregister`, `list`, `listActive`, `setEnabled` |
+| `matcher.mjs` | URL rule evaluation against registered project configs — `testRule`, `testPages`, `match`; in-memory config cache with `invalidate`/`add`/`remove` |
+| `watcher.mjs` | `fs.watch` on each project's `config.json`; 150ms debounce + re-attach on rename events; calls `invalidate()` on change |
+| `injector.mjs` | HTML injection adapted from `src/proxy.mjs` — strips CSP/HSTS/X-Frame-Options, inserts `config`/`bundle`/`runtime` script blocks before `</body>` |
+| `proxy.mjs` | MITM proxy: HTTP forward proxy + HTTPS CONNECT tunnel (in-process TLS server per connection); WebSocket server for live reload |
+| `ipc.mjs` | Unix socket / Windows named pipe — `stop`, `restart`, `status`, `reload` actions; `sendIpcCommand` client helper |
+| `os-proxy.mjs` | Read/set/unset OS system proxy on macOS (`networksetup`), Windows (registry + `InternetSetOption`), Linux (gsettings → kwriteconfig5 → `~/.profile`) |
+| `autostart.mjs` | Login autostart via macOS LaunchAgent plist, Windows `HKCU\Run` registry, Linux systemd user service |
+| `os-trust.mjs` | Install/remove CA cert in OS trust store and Firefox NSS databases; `findFirefoxProfiles()` detects profiles on all platforms |
+| `setup.mjs` | Interactive 7-step TUI setup wizard: port → CA → OS trust → Firefox → system proxy → autostart → write config |
+| `logger.mjs` | Structured append-only event log at `~/.ss-proxy/ss-proxy-service.log`; records URL matches (enabled/disabled), injections with variation + mod list, and errors |
+
+#### `bin/ss-proxy-service.mjs`
+
+New CLI binary registered alongside `ss` in `package.json`. Commands: `setup`, `start [--silent]`, `stop`, `restart`, `status`, `register [path]`, `unregister [path]`, `upgrade`, `uninstall`.
+
+#### Integration with `ss init`
+
+`ss init` checks for `~/.ss-proxy/config.json` and auto-registers the new project with the running daemon. The IPC `reload` action (new in this version) lets `register` hot-reload the daemon's project list without a restart.
+
+#### Logger (`src/service/logger.mjs`)
+
+- Appends to `~/.ss-proxy/ss-proxy-service.log`
+- `[enabled]` — URL matched an active project; logs experience, variation, modifications
+- `[injected]` — HTML injection applied; logs same fields post-inject
+- `[disabled]` — URL would have matched a disabled project
+- `[error]` / `[forward]` / `[injection]` — error context with message
+- `[warn]` — non-fatal warnings (e.g. CONNECT cert errors)
+
+#### Tests (`tests/`)
+
+- `tests/matcher.test.mjs` — 29 unit tests covering all rule types, options, `testPages` include/exclude combos, and `match()` with a real temp config
+- `tests/injector.test.mjs` — 16 unit tests for `stripSecurityHeaders` and `inject` (script blocks, WS scheme, html-init, no-`</body>` graceful handling)
+- `tests/proxy.test.mjs` — 10 integration tests: HTTP passthrough, injection (config/bundle/runtime/`window.__ss`), HTTPS CONNECT tunnel, and IPC live reload
+
+Run: `npm test` (all), `npm run test:unit` (no network), `npm run test:integration`
+
+#### New dependency
+
+- `node-forge` — pure-JS X.509 certificate generation; no native compilation required
+
+#### Bug fixes (found during review)
+
+- `match()` was missing `projectId` in the returned `MatchResult` — injector received `0` for every project
+- `handleHttpRequest` derived `isHttps` from the URL protocol, which is always `http:` inside a CONNECT tunnel (requests arrive as relative paths) — fixed with an explicit `isHttps` parameter
+- `createHttpsServer` in the CONNECT handler was not passing `isHttps=true` to the request handler — HTTPS tunnelled requests were forwarded as plain HTTP
+- `register` IPC ping was a no-op status call; replaced with a `reload` action that refreshes `_projects` in the running daemon without downtime
+
+---
+
 ## 1.2.0
 
 ### Stale-while-revalidate caching

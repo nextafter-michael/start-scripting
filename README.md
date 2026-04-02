@@ -236,6 +236,81 @@ document.querySelector('.hero h1').textContent = {{headline}};
 
 Variables support typed values (`string`, `number`, `boolean`, `null`, `object`, `array`). Renaming a variable in the UI updates all token references in source files automatically.
 
+## ss-proxy-service (always-on system proxy)
+
+`ss-proxy-service` is an optional companion daemon that replaces `ss start` for teams who want to work against real URLs instead of `localhost:3000`.
+
+Instead of running a per-project proxy, it intercepts all browser HTTPS/HTTP traffic at the OS level and injects the active experience's code into matching pages transparently — the address bar always shows the real URL.
+
+### How it works
+
+1. `ss-proxy-service setup` generates a local CA certificate, installs it in your OS and Firefox trust stores, sets the system proxy, and optionally configures autostart
+2. `ss-proxy-service start` (or `--silent` to background it) runs the MITM proxy on `127.0.0.1:8080`
+3. `ss-proxy-service register` (or `ss init` auto-registers) adds a project to the daemon's registry
+4. Open any registered site in any browser — injection happens automatically based on the project's page targeting rules
+
+Multiple projects across multiple domains can be registered and active simultaneously.
+
+### Setup (run once after install)
+
+```bash
+ss-proxy-service setup
+```
+
+The wizard handles everything: CA generation, OS trust store installation, Firefox profile detection, system proxy configuration, and autostart.
+
+> **Note:** Installing the CA certificate into the OS trust store requires a one-time confirmation (macOS shows a password dialog; Windows adds to the CurrentUser store without elevation).
+
+### Commands
+
+```
+ss-proxy-service setup              Interactive setup wizard (run once)
+
+ss-proxy-service start              Start the proxy in the foreground
+ss-proxy-service start --silent     Start as a background daemon (logs → ~/.ss-proxy/proxy.log)
+ss-proxy-service stop               Stop the running daemon
+ss-proxy-service restart            Restart the running daemon
+ss-proxy-service status             Show running state and registered projects
+
+ss-proxy-service register [path]    Add a project to the registry (defaults to cwd)
+ss-proxy-service unregister [path]  Remove a project from the registry
+
+ss-proxy-service upgrade            Upgrade to the latest version
+ss-proxy-service uninstall          Unset proxy, remove CA cert, delete ~/.ss-proxy/
+```
+
+### Integration with ss init
+
+If `ss-proxy-service` is installed (`~/.ss-proxy/config.json` exists), `ss init` automatically registers the new project with the daemon — no manual `register` step needed.
+
+### Service data directory
+
+All service state lives in `~/.ss-proxy/` and is never inside any project directory:
+
+```
+~/.ss-proxy/
+  config.json              Port, log level, autostart flag
+  ca.crt                   Root CA certificate (installed in OS trust store)
+  ca.key                   Root CA private key (never leaves this directory)
+  certs/                   Per-domain certificate cache
+  projects.json            Project registry
+  proxy.pid                PID of the running daemon
+  proxy.log                Daemon stdout/stderr (silent mode)
+  ss-proxy-service.log     Structured event log (matches, injections, errors)
+```
+
+`tail -f ~/.ss-proxy/ss-proxy-service.log` while the proxy is running to watch requests in real time. Each line records whether a URL matched an enabled project (with experience, variation, and modification list), a disabled project, or encountered an error.
+
+### Uninstalling ss-proxy-service
+
+```bash
+ss-proxy-service uninstall
+```
+
+Stops the daemon, unsets the system proxy, removes the CA certificate from all trust stores, and deletes `~/.ss-proxy/`. Project directories and `config.json` files are never touched.
+
+---
+
 ## Updating
 
 ```bash

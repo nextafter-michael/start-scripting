@@ -251,3 +251,81 @@ The proxy self-terminates 8 seconds after all browser page-client WebSocket conn
 - `ws` — WebSocket server
 - `commander` — CLI subcommand parsing
 - `dotenv` — `.env` support (ANTHROPIC_API_KEY for future AI features)
+
+---
+
+## ss-proxy-service (experimental/ss-proxy-server branch)
+
+Always-on system-level MITM proxy daemon. Lives alongside `ss` in this repo; shares `src/service/` modules. Detailed architecture is in `DESIGN.md`.
+
+### Commands
+
+```bash
+ss-proxy-service setup              # One-time setup wizard
+ss-proxy-service start [--silent]   # Foreground or detached daemon
+ss-proxy-service stop / restart     # IPC-based control
+ss-proxy-service status             # Running state + project list
+ss-proxy-service register [path]    # Add project to daemon registry
+ss-proxy-service unregister [path]  # Remove project
+ss-proxy-service upgrade            # Upgrade (same detached-child pattern as ss upgrade)
+ss-proxy-service uninstall          # Full teardown: proxy off, CA removed, ~/.ss-proxy/ deleted
+```
+
+### Service source layout
+
+```
+src/service/
+  cert.mjs         Local CA + per-domain cert cache (node-forge)
+  db.mjs           JSON-file project registry (~/.ss-proxy/projects.json)
+  matcher.mjs      URL rule evaluation; testRule / testPages / match; in-memory config cache
+  watcher.mjs      fs.watch on config.json files; 150ms debounce; calls invalidate() on change
+  injector.mjs     HTML injection — strips CSP/HSTS, inserts config/bundle/runtime before </body>
+  proxy.mjs        MITM proxy: HTTP forward + HTTPS CONNECT tunnel + WS server + IPC wiring
+  ipc.mjs          Unix socket / named pipe IPC — stop / restart / status / reload actions
+  os-proxy.mjs     Read/set/unset OS system proxy (macOS networksetup, Windows registry, Linux gsettings)
+  autostart.mjs    Login autostart (macOS plist, Windows HKCU\Run, Linux systemd user service)
+  os-trust.mjs     OS + Firefox CA trust store install/remove
+  setup.mjs        7-step TUI setup wizard
+  logger.mjs       Append-only event log → ~/.ss-proxy/ss-proxy-service.log
+```
+
+### Service data directory
+
+```
+~/.ss-proxy/
+  config.json              Port, logLevel, autostart, _proxySetByUs
+  ca.crt / ca.key          Local CA certificate and private key (key: chmod 0600)
+  certs/                   Per-domain cert cache (<hostname>.crt + <hostname>.key)
+  projects.json            Project registry: [{ id, path, enabled, added_at }]
+  proxy.pid                PID file for daemon
+  proxy.log                Daemon stdout/stderr (--silent mode)
+  ss-proxy-service.log     Structured event log (matches, injections, errors)
+```
+
+### Logger (`src/service/logger.mjs`)
+
+`log.match(url, matchResult)` — enabled project matched (before forwarding)
+`log.inject(url, matchResult)` — injection applied (after HTML response buffered)
+`log.disabledMatch(url, id, path, expSlug)` — disabled project would have matched
+`log.error(url, err, context)` — proxy/injection/forward error
+`log.warn(msg, fields)` — non-fatal warning
+
+Tag format: `ISO_TIMESTAMP  LEVEL  [tag]  url  field=value ...`
+
+### IPC reload
+
+When `ss-proxy-service register` is called while the daemon is running, it sends `{ action: 'reload' }` via IPC. The daemon calls `listActive()` + `loadAll()` + `startWatching()` in-process — no restart, no downtime.
+
+### `ss init` integration
+
+`bin/ss.mjs` exports `_tryRegisterWithProxyService(projectDir)`. Called at the end of both the default and template `ss init` paths. If `~/.ss-proxy/config.json` exists, it calls `db.register(projectDir)` and sends the IPC reload.
+
+### Tests
+
+```bash
+npm test                  # all 59 tests
+npm run test:unit         # matcher + injector (49 tests, no network)
+npm run test:integration  # proxy integration (10 tests, requires ~/.ss-proxy/ca.crt)
+```
+
+Test files: `tests/matcher.test.mjs`, `tests/injector.test.mjs`, `tests/proxy.test.mjs`. All use Node's built-in `node:test` runner — no test framework dependency.

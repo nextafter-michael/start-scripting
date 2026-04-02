@@ -6,21 +6,27 @@
  * that contains the currently-running script while it's still open).
  *
  * Arguments:
- *   node uninstaller.mjs <toolDir>
+ *   node uninstaller.mjs <toolDir> [--keep-db]
+ *
+ *   --keep-db   Skip deletion of ~/.ss-proxy/projects.db so the project
+ *               registry survives a reinstall.
  *
  * Steps:
  *   1. Short delay so the parent process fully exits and releases any file locks.
  *   2. `npm unlink` in toolDir — removes the global `ss` symlink that `npm link` created.
  *      Falls back to `npm rm -g start-scripting` if unlink exits non-zero.
- *   3. Recursively delete the installation directory (toolDir).
+ *   3. Optionally preserve ~/.ss-proxy/projects.db.
+ *   4. Recursively delete the installation directory (toolDir).
  *   4. Print a final confirmation to stdout (piped to a log file by the parent).
  */
 
 import { execSync } from 'child_process';
-import { rmSync, existsSync } from 'fs';
-import { resolve } from 'path';
+import { rmSync, existsSync, copyFileSync, mkdirSync } from 'fs';
+import { resolve, join } from 'path';
+import { homedir, tmpdir } from 'os';
 
 const toolDir = resolve(process.argv[2] || '');
+const keepDb  = process.argv.includes('--keep-db');
 
 if (!toolDir || !existsSync(toolDir)) {
   console.error('uninstaller: toolDir not found:', toolDir);
@@ -43,7 +49,7 @@ try {
   try {
     execSync('npm rm -g start-scripting', { cwd: toolDir, stdio: 'pipe' });
     console.log('✔ Removed global ss symlink (npm rm -g)');
-  } catch (e2) {
+  } catch {
     // Not fatal — the directory removal below is the critical step.
     // The symlink may already be absent or npm may not be in PATH.
     console.warn('  ⚠ Could not remove npm symlink automatically.');
@@ -53,7 +59,24 @@ try {
   }
 }
 
-// ── Step 2: Delete the installation directory ─────────────────────────────────
+// ── Step 2: Optionally preserve the project registry database ─────────────────
+//
+// The DB lives at ~/.ss-proxy/projects.db — outside the installation directory,
+// so it survives deletion of toolDir regardless. This step only matters if
+// the user also wants to remove ~/.ss-proxy/ (handled by ss-proxy-service uninstall).
+// Here we just log the choice for clarity.
+const dbPath = join(homedir(), '.ss-proxy', 'projects.db');
+if (keepDb) {
+  if (existsSync(dbPath)) {
+    console.log(`✔ Keeping project registry: ${dbPath}`);
+    console.log('  When you reinstall, your registered projects will still be active.');
+  }
+} else {
+  console.log('  Note: ~/.ss-proxy/ (proxy service data) is managed separately.');
+  console.log('  Run `ss-proxy-service uninstall` to remove it if desired.');
+}
+
+// ── Step 3: Delete the installation directory ─────────────────────────────────
 try {
   rmSync(toolDir, { recursive: true, force: true });
   console.log(`✔ Deleted installation directory: ${toolDir}`);
